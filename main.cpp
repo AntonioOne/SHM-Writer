@@ -926,8 +926,14 @@ int main(int argc, char** argv)
 
 #ifdef TAG_OVERLAY
     // Headless: one summary line every 10 s; stop with Ctrl+C / SIGTERM.
-    std::fprintf(stderr, "%s: %.0f Hz, keys %s-%s%s, Ctrl+C to stop\n", kAppName, cfg.rateHz,
-                 hexKey(cfg.rangeLo).c_str(), hexKey(cfg.rangeHi).c_str(),
+    std::string keys;
+    if (cfg.keys.empty()) {
+        keys = hexKey(cfg.rangeLo) + "-" + hexKey(cfg.rangeHi);
+    } else {
+        for (key_t k : cfg.keys)
+            keys += (keys.empty() ? "" : " ") + hexKey(k);
+    }
+    std::fprintf(stderr, "%s: %.0f Hz, keys %s%s, Ctrl+C to stop\n", kAppName, cfg.rateHz, keys.c_str(),
                  cfg.pollUs >= 0 ? (", check every " + std::to_string(cfg.pollUs) + " us").c_str() : "");
     auto lastReport = std::chrono::steady_clock::now();
     while (!gStop) {
