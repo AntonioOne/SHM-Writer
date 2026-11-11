@@ -16,6 +16,17 @@ identical frames.
 The window shows, per segment and buffer: flags, VTD frame number, the value and bytes just written,
 the read-back check, write rate and counters.
 
+## Overlay variant
+
+`ShmFrameTaggerOverlay` is built from the same source (`-DTAG_OVERLAY`) and does everything above,
+plus draws a 100×50 px ellipse (white fill, red border) in the centre of the image with the counter's
+last four digits (`0000`–`9999`), updated every write cycle. Only pixels inside the ellipse are
+written. It is drawn upright for viewers that flip the image (OpenGL bottom-up rows) and requires an
+8-bit-per-channel format (RGB8, RGBA8, 8-bit gray); for other formats only the first 4 pixels are
+written.
+
+Run only one of the two programs at a time: both write the first 4 pixels.
+
 ## Build
 
 Requires OpenCV 4 (core, imgproc, highgui).
@@ -31,6 +42,7 @@ cmake --build build
 ./build/ShmFrameTagger                      # all keys 0x8100-0x81ff at 60 Hz
 ./build/ShmFrameTagger 0x08130 0x08131      # only these keys
 ./build/ShmFrameTagger --rate 60 --range 0x8100 0x81ff
+./build/ShmFrameTaggerOverlay               # same options, plus the centre ellipse counter
 ```
 
 Keys: `q`/`ESC` quit, `p` pause/resume writing.

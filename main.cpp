@@ -47,6 +47,12 @@ std::atomic<bool> gStop{false};
 
 constexpr int kTagPixels = 4;
 
+#ifdef TAG_OVERLAY
+const char* const kAppName = "SHM Frame Tagger + Overlay";
+#else
+const char* const kAppName = "SHM Frame Tagger";
+#endif
+
 std::string hexKey(key_t key)
 {
     char buf[16];
@@ -146,7 +152,65 @@ struct SegmentStatus {
     uint64_t writes = 0;
     uint64_t verifyFailures = 0;
     double writeRate = 0.0;
+    bool overlayActive = false;
+    unsigned overlayValue = 0;
 };
+
+#ifdef TAG_OVERLAY
+constexpr int kOverlayW = 100;
+constexpr int kOverlayH = 50;
+
+// Overlay patch already in image memory layout: rows bottom-up (OpenGL read-back) and
+// RGB channel order, so it appears upright in viewers that flip the image.
+struct Overlay {
+    cv::Mat rgb;
+    cv::Mat mask;
+    uint64_t value = UINT64_MAX;
+};
+
+void buildOverlay(Overlay& ov, uint64_t value)
+{
+    if (ov.value == value)
+        return;
+
+    cv::Mat bgr(kOverlayH, kOverlayW, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat mask(kOverlayH, kOverlayW, CV_8U, cv::Scalar(0));
+    const cv::Point center(kOverlayW / 2, kOverlayH / 2);
+    const cv::Size axes(kOverlayW / 2 - 1, kOverlayH / 2 - 1);
+    cv::ellipse(mask, center, axes, 0, 0, 360, cv::Scalar(255), cv::FILLED, cv::LINE_8);
+    cv::ellipse(bgr, center, axes, 0, 0, 360, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_8);
+    cv::ellipse(bgr, center, axes, 0, 0, 360, cv::Scalar(0, 0, 255), 2, cv::LINE_8);
+
+    char text[8];
+    std::snprintf(text, sizeof(text), "%04u", static_cast<unsigned>(value % 10000));
+    int baseline = 0;
+    const double scale = 0.8;
+    const int thickness = 2;
+    const cv::Size ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, thickness, &baseline);
+    cv::putText(bgr, text, cv::Point((kOverlayW - ts.width) / 2, (kOverlayH + ts.height) / 2),
+                cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(0, 0, 0), thickness, cv::LINE_AA);
+
+    cv::flip(bgr, bgr, 0);
+    cv::flip(mask, ov.mask, 0);
+    cv::cvtColor(bgr, ov.rgb, cv::COLOR_BGR2RGB);
+    ov.value = value;
+}
+
+bool isEightBitPerChannel(int fmt)
+{
+    switch (fmt) {
+    case RDB_PIX_FORMAT_RGB_24:
+    case RDB_PIX_FORMAT_RGB8:
+    case RDB_PIX_FORMAT_RGBA_24:
+    case RDB_PIX_FORMAT_RGBA8:
+    case RDB_PIX_FORMAT_RED8:
+    case RDB_PIX_FORMAT_BW_8:
+        return true;
+    default:
+        return false;
+    }
+}
+#endif
 
 class Segment {
 public:
@@ -317,6 +381,11 @@ private:
 
         std::memcpy(base_ + dataOffset, tag, n);
         std::atomic_thread_fence(std::memory_order_seq_cst);
+#ifdef TAG_OVERLAY
+        buildOverlay(overlay_, status_.counter);
+        if (!writeOverlay(img, dataOffset, bpp))
+            bs.note = "overlay: needs 8-bit RGB/RGBA/gray, >= 100x50";
+#endif
 
         bs.written = true;
         bs.verified = std::memcmp(base_ + dataOffset, tag, n) == 0;
@@ -328,6 +397,49 @@ private:
         }
         return true;
     }
+
+#ifdef TAG_OVERLAY
+    // Writes the overlay ellipse (only pixels inside it) centred in the image.
+    bool writeOverlay(const RDB_IMAGE_t& img, size_t dataOffset, unsigned bpp)
+    {
+        if (!isEightBitPerChannel(img.pixelFormat) || img.width < kOverlayW || img.height < kOverlayH)
+            return false;
+        const size_t stride = img.imgSize / img.height;
+        if (stride < size_t(img.width) * bpp)
+            return false;
+
+        const size_t x0 = (img.width - kOverlayW) / 2;
+        const size_t y0 = (img.height - kOverlayH) / 2;
+        if (dataOffset + (y0 + kOverlayH - 1) * stride + (x0 + kOverlayW) * bpp > size_)
+            return false;
+
+        for (int y = 0; y < kOverlayH; ++y) {
+            uint8_t* row = base_ + dataOffset + (y0 + y) * stride + x0 * bpp;
+            const uint8_t* src = overlay_.rgb.ptr<uint8_t>(y);
+            const uint8_t* mask = overlay_.mask.ptr<uint8_t>(y);
+            for (int x = 0; x < kOverlayW; ++x) {
+                if (!mask[x])
+                    continue;
+                uint8_t* d = row + x * bpp;
+                const uint8_t* s = src + 3 * x;
+                if (bpp == 1) {
+                    d[0] = static_cast<uint8_t>((s[0] * 77 + s[1] * 150 + s[2] * 29) >> 8);
+                } else {
+                    d[0] = s[0];
+                    d[1] = s[1];
+                    d[2] = s[2];
+                    if (bpp == 4)
+                        d[3] = 255;
+                }
+            }
+        }
+        status_.overlayValue = static_cast<unsigned>(overlay_.value % 10000);
+        status_.overlayActive = true;
+        return true;
+    }
+
+    Overlay overlay_;
+#endif
 
     SegmentStatus status_;
     int id_ = -1;
@@ -431,14 +543,14 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
     for (const auto& s : segs)
         rows += 2 + int(std::max<size_t>(s.buffers.size(), 1));
     const int height = std::max(160, 70 + rows * rowH + 20);
-    cv::Mat img(height, 1250, CV_8UC3, cv::Scalar(30, 30, 30));
+    cv::Mat img(height, 1260, CV_8UC3, cv::Scalar(30, 30, 30));
 
     const cv::Scalar white(230, 230, 230), gray(150, 150, 150), green(80, 220, 80), red(80, 80, 255),
         yellow(60, 220, 230), cyan(230, 200, 80);
 
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "SHM Frame Tagger   keys 0x81xx   loop %.1f Hz   max late %.2f ms   %s",
-                  loopRate, maxLateMs, paused ? "PAUSED (p to resume)" : "WRITING (p to pause, q to quit)");
+    std::snprintf(buf, sizeof(buf), "%s   keys 0x81xx   loop %.1f Hz   max late %.2f ms   %s",
+                  kAppName, loopRate, maxLateMs, paused ? "PAUSED (p to resume)" : "WRITING (p to pause, q to quit)");
     drawText(img, buf, 12, 26, paused ? yellow : white, 0.55);
 
     int y = 60;
@@ -458,6 +570,10 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
         else
             std::snprintf(buf, sizeof(buf), "%s   %s", hexKey(s.key).c_str(), s.error.c_str());
         drawText(img, buf, 12, y, s.error.empty() ? cyan : red, 0.48);
+        if (s.overlayActive) {
+            std::snprintf(buf, sizeof(buf), "overlay %04u", s.overlayValue);
+            drawText(img, buf, 1120, y, green, 0.48);
+        }
         y += rowH;
 
         const int xBuf = 30, xFlags = 80, xFrame = 150, xValue = 260, xBytes = 400, xCheck = 820, xNote = 920;
@@ -550,7 +666,7 @@ int main(int argc, char** argv)
     std::atomic<bool> paused{false};
     std::thread writer(writerThread, std::cref(cfg), std::ref(shared), std::ref(paused));
 
-    const std::string title = "SHM Frame Tagger";
+    const std::string title = kAppName;
     cv::namedWindow(title, cv::WINDOW_AUTOSIZE);
     while (!gStop) {
         std::vector<SegmentStatus> segs;

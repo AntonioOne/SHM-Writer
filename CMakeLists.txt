@@ -13,3 +13,9 @@ find_package(Threads REQUIRED)
 add_executable(ShmFrameTagger main.cpp)
 target_include_directories(ShmFrameTagger PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(ShmFrameTagger PRIVATE ${OpenCV_LIBS} Threads::Threads)
+
+# Same tool plus a 100x50 ellipse with a 0000-9999 counter drawn in the image centre.
+add_executable(ShmFrameTaggerOverlay main.cpp)
+target_compile_definitions(ShmFrameTaggerOverlay PRIVATE TAG_OVERLAY)
+target_include_directories(ShmFrameTaggerOverlay PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ShmFrameTaggerOverlay PRIVATE ${OpenCV_LIBS} Threads::Threads)
