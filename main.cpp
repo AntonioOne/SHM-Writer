@@ -165,6 +165,7 @@ struct SegmentStatus {
     unsigned overlayValue = 0;
     uint64_t reclaims = 0;
     double reclaimRate = 0.0;
+    uint64_t forcedCaptures = 0;
 };
 
 #ifdef TAG_OVERLAY
@@ -343,21 +344,20 @@ public:
 
 #ifdef TAG_OVERLAY
     // Between cycles: rewrites the stamp and digits of any buffer whose territory another
-    // writer has touched. Producers copy the image front to back, so checking the stamp plus
-    // the first and last digit rows catches an overwrite wherever the copy currently is.
+    // writer has touched.
     void guard()
     {
         for (auto& t : territories_) {
             if (!t.valid)
                 continue;
             const bool tagChanged = std::memcmp(base_ + t.dataOffset, t.tag, t.n) != 0;
-            const bool areaChanged = t.overlay && t.hasBg && (!areaRowSame(t, 0) || !areaRowSame(t, kOverlayH - 1));
+            const bool areaChanged = t.overlay && t.hasBg && !areaIntact(t);
             if (!tagChanged && !areaChanged)
                 continue;
             if (tagChanged)
                 std::memcpy(base_ + t.dataOffset, t.tag, t.n);
             if (t.overlay)
-                refreshOverlay(t, tagChanged);
+                refreshOverlay(t, currentFrameNo(t), tagChanged);
             ++status_.reclaims;
             ++reclaimsInWindow_;
         }
@@ -460,8 +460,8 @@ private:
                      terr->img.width != img.width || terr->img.height != img.height ||
                      terr->img.imgSize != img.imgSize))
             *terr = Territory{};
-        // Our previous stamp is gone: the producer has started writing a new frame.
-        const bool tagChanged = terr && terr->valid && std::memcmp(base_ + dataOffset, terr->tag, n) != 0;
+        // Our previous stamp is gone: the producer has started (or finished) writing a new frame.
+        const bool stampGone = terr && terr->valid && std::memcmp(base_ + dataOffset, terr->tag, n) != 0;
 #endif
 
         std::memcpy(base_ + dataOffset, tag, n);
@@ -469,6 +469,7 @@ private:
 #ifdef TAG_OVERLAY
         if (terr) {
             terr->valid = true;
+            terr->msgOffset = info.offset;
             terr->dataOffset = dataOffset;
             terr->bpp = bpp;
             terr->img = img;
@@ -479,7 +480,7 @@ private:
                 bs.note = "digits: needs 8-bit RGB/RGBA/gray, >= 100x50";
             } else {
                 buildOverlay(overlay_, value_);
-                if (!refreshOverlay(*terr, tagChanged))
+                if (!refreshOverlay(*terr, bs.frameNo, stampGone))
                     bs.note = "digits deferred: producer is copying";
             }
         }
@@ -510,7 +511,17 @@ private:
         bool hasBg = false;
         std::vector<uint8_t> bg;
         std::vector<uint8_t> written;
+        size_t msgOffset = 0;
+        uint32_t bgFrameNo = 0;                              // frame the background was taken from
+        std::chrono::steady_clock::time_point deferredSince; // epoch = not deferring
     };
+
+    uint32_t currentFrameNo(const Territory& t) const
+    {
+        RDB_MSG_HDR_t msg{};
+        readAt(t.msgOffset, msg);
+        return msg.frameNo;
+    }
 
     bool overlaySupported(const RDB_IMAGE_t& img, size_t dataOffset, unsigned bpp) const
     {
@@ -532,32 +543,55 @@ private:
         return base_ + t.dataOffset + (y0 + y) * stride + x0 * t.bpp;
     }
 
-    bool areaRowSame(const Territory& t, int y) const
+    // True if the whole centre area still holds exactly what we wrote last.
+    bool areaIntact(const Territory& t) const
     {
         const size_t rowBytes = size_t(kOverlayW) * t.bpp;
-        return t.written.size() == rowBytes * kOverlayH &&
-               std::memcmp(areaRow(t, y), t.written.data() + y * rowBytes, rowBytes) == 0;
+        if (t.written.size() != rowBytes * kOverlayH)
+            return false;
+        for (int y = 0; y < kOverlayH; ++y)
+            if (std::memcmp(areaRow(t, y), t.written.data() + y * rowBytes, rowBytes) != 0)
+                return false;
+        return true;
     }
 
     // Writes background + current digits over the whole centre area, so digits of the previous
     // value are erased back to the producer's pixels (no ghosting, no visible box).
-    // Returns false if the producer is part-way through copying the area (retry later).
-    bool refreshOverlay(Territory& t, bool tagChanged)
+    //  - nothing touched since our last write: reuse the saved background;
+    //  - a new frame number is published: the producer finished the frame, its pixels become
+    //    the new background;
+    //  - stamp or area changed but same frame number: the producer is still copying -> defer
+    //    (returns false), unless that lasts > 50 ms (producer that publishes before copying).
+    bool refreshOverlay(Territory& t, uint32_t frameNo, bool stampGone)
     {
+        using clock = std::chrono::steady_clock;
         const size_t rowBytes = size_t(kOverlayW) * t.bpp;
-        if (!t.hasBg || !areaRowSame(t, kOverlayH - 1)) {
-            // The producer's copy has passed the whole area: its pixels are the new background.
+        bool capture = !t.hasBg;
+        if (!capture && (stampGone || frameNo != t.bgFrameNo || !areaIntact(t))) {
+            if (frameNo != t.bgFrameNo) {
+                capture = true;
+            } else {
+                const auto now = clock::now();
+                if (t.deferredSince == clock::time_point{})
+                    t.deferredSince = now;
+                if (now - t.deferredSince < std::chrono::milliseconds(50))
+                    return false;
+                capture = true;
+                ++status_.forcedCaptures;
+            }
+        }
+        if (capture) {
             t.bg.resize(rowBytes * kOverlayH);
             for (int y = 0; y < kOverlayH; ++y)
                 std::memcpy(t.bg.data() + y * rowBytes, areaRow(t, y), rowBytes);
             t.hasBg = true;
-        } else if (tagChanged || !areaRowSame(t, 0)) {
-            return false;
+            t.bgFrameNo = frameNo;
         }
+        t.deferredSince = clock::time_point{};
 
-        t.written = t.bg;
+        std::vector<uint8_t> next = t.bg;
         for (int y = 0; y < kOverlayH; ++y) {
-            uint8_t* row = t.written.data() + y * rowBytes;
+            uint8_t* row = next.data() + y * rowBytes;
             const uint8_t* src = overlay_.rgb.ptr<uint8_t>(y);
             for (const auto& span : overlay_.spans[y]) {
                 for (int x = span.first; x <= span.second; ++x) {
@@ -575,8 +609,15 @@ private:
                 }
             }
         }
+        // A producer copies the image front to back, so it overwrites our stamp at the image start
+        // long before it reaches the centre. If the stamp is already gone, a new frame copy has
+        // started: writing the old background now could mix into the new frame, so skip.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (std::memcmp(base_ + t.dataOffset, t.tag, t.n) != 0)
+            return false;
         for (int y = 0; y < kOverlayH; ++y)
-            std::memcpy(areaRow(t, y), t.written.data() + y * rowBytes, rowBytes);
+            std::memcpy(areaRow(t, y), next.data() + y * rowBytes, rowBytes);
+        t.written.swap(next);
 
         status_.overlayValue = static_cast<unsigned>(overlay_.value % 10000);
         status_.overlayActive = true;
@@ -880,18 +921,20 @@ int main(int argc, char** argv)
             continue;
         lastReport = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(shared.mutex);
-        uint64_t next = 0, fails = 0, reclaims = 0;
+        uint64_t next = 0, fails = 0, reclaims = 0, forced = 0;
         double rate = 0.0;
         for (const auto& s : shared.segments) {
             next = std::max(next, s.counter);
             fails += s.verifyFailures;
             reclaims += s.reclaims;
+            forced += s.forcedCaptures;
             rate = std::max(rate, s.writeRate);
         }
         std::fprintf(stderr, "[stats] %zu segment(s)  value %llu (digits %04llu)  %.1f writes/s  max late %.2f ms  "
-                             "readback fail %llu  reclaims %llu\n",
+                             "readback fail %llu  reclaims %llu  forced bg captures %llu\n",
                      shared.segments.size(), (unsigned long long)next, (unsigned long long)(next % 10000), rate,
-                     shared.maxLateMs, (unsigned long long)fails, (unsigned long long)reclaims);
+                     shared.maxLateMs, (unsigned long long)fails, (unsigned long long)reclaims,
+                     (unsigned long long)forced);
     }
 #else
     const std::string title = kAppName;
