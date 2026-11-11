@@ -20,23 +20,34 @@ the read-back check, write rate and counters.
 
 `ShmFrameTaggerOverlay` is built from the same source (`-DTAG_OVERLAY`). Differences:
 
-- **No window.** It prints attach/detach events and one summary line every 10 s; stop with Ctrl+C.
-- **200 Hz** by default, counter **+1 per write** (`--rate` to change).
-- Also draws the counter's last four digits (`0000`–`9999`) in the image centre (100×50 area):
-  white digits with a black outline, no surrounding shape. The producer's pixels in that area are
-  saved after each new VTD frame, and every write composes *saved background + new digits*, so
-  digits of the previous value are erased (no ghosting, no visible box).
-- If VTD is part-way through copying the centre area, the digits are deferred to the next cycle
-  so that a half-written frame is never saved as background. The first-4-pixel counter is
-  written every cycle regardless, so frames never repeat.
+- **No window.** Prints attach/detach events and one summary line every 10 s; stop with Ctrl+C.
+- **200 Hz** by default (`--rate`), counter **+1 per write**.
+- Draws the counter's last four digits (`0000`–`9999`) in the image centre: white digits with a
+  black outline, no surrounding shape. Only the rows of the digit band are written, as
+  *saved producer background + digits*, so old digits never ghost and no box is visible.
+- **Digits are kept visible when VTD writes new frames.** Between writes the band is checked every
+  `--poll-us` (default **50 µs**). As soon as VTD's copy has passed the whole band (in either copy
+  direction), the new pixels become the background and the digits are redrawn — normally before VTD
+  publishes the frame number, so a reader sees the digits on the new frame immediately.
+- When VTD stalls, nothing overwrites the band, so the digits (and the first-4-pixel counter) keep
+  changing at the write rate: consecutive reads are never identical.
 - Only 8-bit-per-channel formats (RGB8, RGBA8, 8-bit gray) get digits; others only get the counter.
-- Optional territory guard between writes: `--poll-us <us>` (0 = spin, one CPU core busy). Off by
-  default.
 - Links only `opencv_core` and `opencv_imgproc` (no GUI libraries).
 
-Measured with a simulated VTD of 2 × 3840×2160 + 9 × 2560×1440 RGB8 streams (whole-image copy per
-frame): the tagger at 200 Hz used about 6 % of one CPU core (the simulated VTD itself 53 % at 30 Hz,
-~120 % at 60 Hz).
+Measured with a simulated VTD of 2 × 3840×2160 + 9 × 2560×1440 RGB8 streams at 60 Hz (forward,
+backward and glibc whole-image copies), tagger `--rate 400`:
+
+| `--poll-us` | digits seen by a random-time reader (newest buffer) | tagger CPU (one core) |
+|---|---|---|
+| 200 | 99.1–99.5 % | 10–15 % |
+| 100 | 99.6–99.9 % | 14–16 % |
+| 50 (default) | 100 % | 17–19 % |
+
+With VTD stalled at 16 Hz and a 30 Hz reader: 0 identical consecutive images, 0 reads without
+digits (without the tagger: 131 of 180 reads were identical).
+
+Rare race: if VTD crosses the band during the few microseconds the band is written, a few band rows
+can show the previous frame's background for one frame (a few per thousand frames).
 
 Run only one of the two programs at a time: both write the first 4 pixels.
 
