@@ -25,6 +25,19 @@ written. It is drawn upright for viewers that flip the image (OpenGL bottom-up r
 8-bit-per-channel format (RGB8, RGBA8, 8-bit gray); for other formats only the first 4 pixels are
 written.
 
+Between 60 Hz cycles the overlay build treats the stamp and the ellipse as **owned territory**: it
+checks them continuously and rewrites them the moment another writer (VTD) overwrites them. The check
+looks at the stamp and the first/last ellipse rows, so a front-to-back image copy is caught while it is
+still in progress and the ellipse is restored before the copy finishes.
+
+- `--poll-us 0` (default): spin; uses about one CPU core. With a reader that reads the instant a new
+  VTD frame appears, the ellipse was present in 100 % of frames (simulated VTD) and in 600/600 random
+  samples on a real VTD.
+- `--poll-us 100`: check every 100 µs; about 20 % of one core, ellipse present at the instant of a new
+  frame in about 80 % of frames.
+
+The window shows how often the territory was reclaimed (≈ the rate at which VTD writes new frames).
+
 Run only one of the two programs at a time: both write the first 4 pixels.
 
 ## Build
@@ -43,6 +56,7 @@ cmake --build build
 ./build/ShmFrameTagger 0x08130 0x08131      # only these keys
 ./build/ShmFrameTagger --rate 60 --range 0x8100 0x81ff
 ./build/ShmFrameTaggerOverlay               # same options, plus the centre ellipse counter
+./build/ShmFrameTaggerOverlay --poll-us 100 # cheaper territory check
 ```
 
 Keys: `q`/`ESC` quit, `p` pause/resume writing.

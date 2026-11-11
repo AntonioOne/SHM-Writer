@@ -8,12 +8,17 @@
 //    unsigned integer (last byte least significant) that starts at 0 and increases
 //    by one per write cycle.
 //  - Other writers (VTD) are not coordinated with: every buffer is stamped every cycle.
+//  - Overlay build (-DTAG_OVERLAY): additionally a 100x50 ellipse with the counter's last
+//    four digits is drawn in the image centre. Between cycles the stamp and ellipse are
+//    treated as owned territory: they are checked every --poll-us (default 0 = spin)
+//    and rewritten immediately whenever another writer (VTD) has overwritten them.
 //  - SHM headers, buffer infos and flags (LOCK / TC / IG) are never written.
 //
-// Usage: ShmFrameTagger [--range <lo> <hi>] [--rate <Hz>] [key ...]
+// Usage: ShmFrameTagger [--range <lo> <hi>] [--rate <Hz>] [--poll-us <us>] [key ...]
 // Keys:  q/ESC quit, p pause/resume writing
 
 #include <sys/ipc.h>
+#include <sys/prctl.h>
 #include <sys/shm.h>
 
 #include <opencv2/core.hpp>
@@ -154,6 +159,8 @@ struct SegmentStatus {
     double writeRate = 0.0;
     bool overlayActive = false;
     unsigned overlayValue = 0;
+    uint64_t reclaims = 0;
+    double reclaimRate = 0.0;
 };
 
 #ifdef TAG_OVERLAY
@@ -166,6 +173,8 @@ struct Overlay {
     cv::Mat rgb;
     cv::Mat mask;
     uint64_t value = UINT64_MAX;
+    int firstRow = 0;
+    int lastRow = kOverlayH - 1;
 };
 
 void buildOverlay(Overlay& ov, uint64_t value)
@@ -194,6 +203,12 @@ void buildOverlay(Overlay& ov, uint64_t value)
     cv::flip(mask, ov.mask, 0);
     cv::cvtColor(bgr, ov.rgb, cv::COLOR_BGR2RGB);
     ov.value = value;
+    ov.firstRow = 0;
+    while (ov.firstRow < kOverlayH - 1 && cv::countNonZero(ov.mask.row(ov.firstRow)) == 0)
+        ++ov.firstRow;
+    ov.lastRow = kOverlayH - 1;
+    while (ov.lastRow > 0 && cv::countNonZero(ov.mask.row(ov.lastRow)) == 0)
+        --ov.lastRow;
 }
 
 bool isEightBitPerChannel(int fmt)
@@ -266,6 +281,9 @@ public:
         }
 
         status_.buffers.resize(hdr.noBuffers);
+#ifdef TAG_OVERLAY
+        territories_.assign(hdr.noBuffers, Territory{});
+#endif
         bool anyWritten = false;
         for (unsigned i = 0; i < hdr.noBuffers; ++i) {
             BufferStatus& bs = status_.buffers[i];
@@ -285,9 +303,33 @@ public:
         if (dt >= 1.0) {
             status_.writeRate = writesInWindow_ / dt;
             writesInWindow_ = 0;
+#ifdef TAG_OVERLAY
+            status_.reclaimRate = reclaimsInWindow_ / dt;
+            reclaimsInWindow_ = 0;
+#endif
             rateStart_ = now;
         }
     }
+
+#ifdef TAG_OVERLAY
+    // Between cycles: rewrites the stamp and ellipse of any buffer whose territory another
+    // writer has touched. Producers copy the image front to back, so checking the stamp plus
+    // the first and last ellipse rows catches an overwrite wherever the copy currently is.
+    void guard()
+    {
+        for (auto& t : territories_) {
+            if (!t.valid)
+                continue;
+            if (std::memcmp(base_ + t.dataOffset, t.tag, t.n) == 0 && overlayIntact(t))
+                continue;
+            std::memcpy(base_ + t.dataOffset, t.tag, t.n);
+            if (t.overlay)
+                writeOverlay(t.img, t.dataOffset, t.bpp);
+            ++status_.reclaims;
+            ++reclaimsInWindow_;
+        }
+    }
+#endif
 
 private:
     template <typename T>
@@ -383,8 +425,19 @@ private:
         std::atomic_thread_fence(std::memory_order_seq_cst);
 #ifdef TAG_OVERLAY
         buildOverlay(overlay_, status_.counter);
-        if (!writeOverlay(img, dataOffset, bpp))
+        const bool overlayOk = writeOverlay(img, dataOffset, bpp);
+        if (!overlayOk)
             bs.note = "overlay: needs 8-bit RGB/RGBA/gray, >= 100x50";
+        if (size_t(bs.index) < territories_.size()) {
+            Territory& t = territories_[bs.index];
+            t.valid = true;
+            t.overlay = overlayOk;
+            t.dataOffset = dataOffset;
+            t.bpp = bpp;
+            t.img = img;
+            t.n = n;
+            std::memcpy(t.tag, tag, n);
+        }
 #endif
 
         bs.written = true;
@@ -438,7 +491,47 @@ private:
         return true;
     }
 
+    struct Territory {
+        bool valid = false;
+        bool overlay = false;
+        size_t dataOffset = 0;
+        unsigned bpp = 0;
+        RDB_IMAGE_t img{};
+        size_t n = 0;
+        uint8_t tag[16 * kTagPixels] = {};
+    };
+
+    bool overlayRowIntact(const Territory& t, int y) const
+    {
+        const size_t stride = t.img.imgSize / t.img.height;
+        const size_t x0 = (t.img.width - kOverlayW) / 2;
+        const size_t y0 = (t.img.height - kOverlayH) / 2;
+        const uint8_t* row = base_ + t.dataOffset + (y0 + y) * stride + x0 * t.bpp;
+        const uint8_t* src = overlay_.rgb.ptr<uint8_t>(y);
+        const uint8_t* mask = overlay_.mask.ptr<uint8_t>(y);
+        for (int x = 0; x < kOverlayW; ++x) {
+            if (!mask[x])
+                continue;
+            const uint8_t* d = row + x * t.bpp;
+            const uint8_t* s = src + 3 * x;
+            if (t.bpp == 1) {
+                if (d[0] != static_cast<uint8_t>((s[0] * 77 + s[1] * 150 + s[2] * 29) >> 8))
+                    return false;
+            } else if (d[0] != s[0] || d[1] != s[1] || d[2] != s[2] || (t.bpp == 4 && d[3] != 255)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool overlayIntact(const Territory& t) const
+    {
+        return !t.overlay || (overlayRowIntact(t, overlay_.firstRow) && overlayRowIntact(t, overlay_.lastRow));
+    }
+
     Overlay overlay_;
+    std::vector<Territory> territories_;
+    int reclaimsInWindow_ = 0;
 #endif
 
     SegmentStatus status_;
@@ -461,10 +554,15 @@ struct Config {
     long rangeHi = 0x81ff;
     std::set<key_t> keys;
     double rateHz = 60.0;
+    int pollUs = 0;
 };
 
 void writerThread(const Config& cfg, SharedState& shared, std::atomic<bool>& paused)
 {
+#ifdef TAG_OVERLAY
+    // Default 50 us timer slack would make the short polling sleeps much longer.
+    prctl(PR_SET_TIMERSLACK, 1000UL);
+#endif
     std::map<key_t, std::unique_ptr<Segment>> segments;
     auto wanted = [&](key_t key) {
         return cfg.keys.empty() ? (key >= cfg.rangeLo && key <= cfg.rangeHi) : cfg.keys.count(key) > 0;
@@ -527,7 +625,19 @@ void writerThread(const Config& cfg, SharedState& shared, std::atomic<bool>& pau
         next += period;
         if (clock::now() - next > period * 5)
             next = clock::now();
+#ifdef TAG_OVERLAY
+        while (!gStop && clock::now() < next) {
+            if (!paused)
+                for (auto& kv : segments)
+                    kv.second->guard();
+            if (cfg.pollUs > 0)
+                std::this_thread::sleep_for(std::chrono::microseconds(cfg.pollUs));
+            else
+                __builtin_ia32_pause(); // spin: catches an overwrite while the producer is still copying
+        }
+#else
         std::this_thread::sleep_until(next);
+#endif
     }
 }
 
@@ -541,7 +651,7 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
     const int rowH = 22;
     int rows = 0;
     for (const auto& s : segs)
-        rows += 2 + int(std::max<size_t>(s.buffers.size(), 1));
+        rows += 2 + (s.overlayActive ? 1 : 0) + int(std::max<size_t>(s.buffers.size(), 1));
     const int height = std::max(160, 70 + rows * rowH + 20);
     cv::Mat img(height, 1260, CV_8UC3, cv::Scalar(30, 30, 30));
 
@@ -570,11 +680,13 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
         else
             std::snprintf(buf, sizeof(buf), "%s   %s", hexKey(s.key).c_str(), s.error.c_str());
         drawText(img, buf, 12, y, s.error.empty() ? cyan : red, 0.48);
-        if (s.overlayActive) {
-            std::snprintf(buf, sizeof(buf), "overlay %04u", s.overlayValue);
-            drawText(img, buf, 1120, y, green, 0.48);
-        }
         y += rowH;
+        if (s.overlayActive) {
+            std::snprintf(buf, sizeof(buf), "overlay %04u   reclaimed after another writer overwrote it: %llu (%.1f/s)",
+                          s.overlayValue, (unsigned long long)s.reclaims, s.reclaimRate);
+            drawText(img, buf, 30, y, green, 0.48);
+            y += rowH;
+        }
 
         const int xBuf = 30, xFlags = 80, xFrame = 150, xValue = 260, xBytes = 400, xCheck = 820, xNote = 920;
         drawText(img, "buf", xBuf, y, gray, 0.45);
@@ -615,8 +727,10 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
 void usage(const char* prog)
 {
     std::fprintf(stderr,
-                 "Usage: %s [--range <lo> <hi>] [--rate <Hz>] [key ...]\n"
+                 "Usage: %s [--range <lo> <hi>] [--rate <Hz>] [--poll-us <us>] [key ...]\n"
                  "  Default: all shared memory keys 0x8100-0x81ff at 60 Hz.\n"
+                 "  --poll-us: overlay build only, territory check interval (default 0);\n"
+                 "             0 = spin (one CPU core busy, repairs while the producer is still copying).\n"
                  "Keys:  q/ESC quit, p pause/resume writing\n",
                  prog);
 }
@@ -642,6 +756,12 @@ int main(int argc, char** argv)
         } else if (a == "--rate" && i + 1 < argc) {
             cfg.rateHz = std::atof(argv[++i]);
             if (cfg.rateHz <= 0.0) {
+                usage(argv[0]);
+                return 1;
+            }
+        } else if (a == "--poll-us" && i + 1 < argc) {
+            cfg.pollUs = std::atoi(argv[++i]);
+            if (cfg.pollUs < 0) {
                 usage(argv[0]);
                 return 1;
             }
