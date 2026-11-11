@@ -5,14 +5,15 @@ identical frames.
 
 - Monitors all System V shared memory keys `0x8100`–`0x81ff` (every 0.5 s via `/proc/sysvipc/shm`).
 - At 60 Hz, writes only the bytes of the **first 4 pixels** of the image data in **every buffer**
-  (4 × bytes-per-pixel, e.g. 12 bytes for RGB8). Pixel *i* gets `(n + i) % 256` in each of its
-  bytes; `n` increases by one per write cycle (0 1 2 3 → 1 2 3 4 → …).
+  (4 × bytes-per-pixel, e.g. 12 bytes for RGB8). These bytes hold one **big-endian** unsigned
+  integer (last byte least significant) that starts at 0 on program start and increases by one
+  per write cycle, e.g. `00 … 00 04 D2` = 1234.
 - Does not coordinate with other writers (VTD): every buffer is stamped every cycle. If VTD writes
   a new frame over the stamp, that frame is new anyway and the next cycle stamps it again.
 - Never writes SHM headers, buffer infos or flags (LOCK / TC / IG).
 - Standalone: no VTD headers or libraries required (see `rdb_shm.h`).
 
-The window shows, per segment and buffer: flags, VTD frame number, the 4 values just written,
+The window shows, per segment and buffer: flags, VTD frame number, the value and bytes just written,
 the read-back check, write rate and counters.
 
 ## Build

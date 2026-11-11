@@ -1,11 +1,12 @@
 // ShmFrameTagger: a third writer on RDB image shared memory (keys 0x8100-0x81ff).
-// At 60 Hz it stamps a rolling counter into the first 4 pixels of the image in every
+// At 60 Hz it writes a counter into the first 4 pixels of the image in every
 // buffer, so no two reads of the image are ever identical frames.
 //
 // Rules:
 //  - Only the bytes of the first 4 pixels of the image data are written
-//    (4 * bytesPerPixel, e.g. 12 bytes for RGB8). Pixel i gets (n + i) % 256 in each byte;
-//    n increases by one per write cycle.
+//    (4 * bytesPerPixel, e.g. 12 bytes for RGB8). Those bytes hold one big-endian
+//    unsigned integer (last byte least significant) that starts at 0 and increases
+//    by one per write cycle.
 //  - Other writers (VTD) are not coordinated with: every buffer is stamped every cycle.
 //  - SHM headers, buffer infos and flags (LOCK / TC / IG) are never written.
 //
@@ -127,7 +128,9 @@ struct BufferStatus {
     uint32_t frameNo = 0;
     bool written = false;
     bool verified = false;
-    uint8_t values[kTagPixels] = {};
+    uint64_t value = 0;
+    uint8_t bytes[16 * kTagPixels] = {};
+    size_t byteCount = 0;
     std::string note;
 };
 
@@ -139,7 +142,7 @@ struct SegmentStatus {
     unsigned bpp = 0;
     std::string error;
     std::vector<BufferStatus> buffers;
-    uint32_t counter = 0;
+    uint64_t counter = 0;
     uint64_t writes = 0;
     uint64_t verifyFailures = 0;
     double writeRate = 0.0;
@@ -303,11 +306,14 @@ private:
             return false;
         }
 
-        uint8_t tag[16 * kTagPixels];
-        for (int p = 0; p < kTagPixels; ++p) {
-            bs.values[p] = static_cast<uint8_t>((status_.counter + p) & 0xff);
-            std::memset(tag + p * bpp, bs.values[p], bpp);
-        }
+        // Big-endian counter over all n bytes; a 64-bit counter fills the low 8 bytes and
+        // the higher bytes stay 0 (it cannot overflow at 60 Hz in practice).
+        uint8_t tag[16 * kTagPixels] = {};
+        bs.value = status_.counter;
+        for (size_t b = 0; b < n && b < sizeof(uint64_t); ++b)
+            tag[n - 1 - b] = static_cast<uint8_t>(bs.value >> (8 * b));
+        std::memcpy(bs.bytes, tag, n);
+        bs.byteCount = n;
 
         std::memcpy(base_ + dataOffset, tag, n);
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -425,7 +431,7 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
     for (const auto& s : segs)
         rows += 2 + int(std::max<size_t>(s.buffers.size(), 1));
     const int height = std::max(160, 70 + rows * rowH + 20);
-    cv::Mat img(height, 1100, CV_8UC3, cv::Scalar(30, 30, 30));
+    cv::Mat img(height, 1250, CV_8UC3, cv::Scalar(30, 30, 30));
 
     const cv::Scalar white(230, 230, 230), gray(150, 150, 150), green(80, 220, 80), red(80, 80, 255),
         yellow(60, 220, 230), cyan(230, 200, 80);
@@ -444,21 +450,22 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
     for (const auto& s : segs) {
         if (s.error.empty())
             std::snprintf(buf, sizeof(buf),
-                          "%s   %ux%u %s (%u B/px, %u B written per buffer)   n=%u   %.1f writes/s   "
-                          "writes %llu   readback fail %llu",
+                          "%s   %ux%u %s (%u B/px, %u B written per buffer, big-endian)   next=%llu   "
+                          "%.1f writes/s   writes %llu   readback fail %llu",
                           hexKey(s.key).c_str(), s.width, s.height, s.format.c_str(), s.bpp,
-                          s.bpp * kTagPixels, s.counter, s.writeRate, (unsigned long long)s.writes,
-                          (unsigned long long)s.verifyFailures);
+                          s.bpp * kTagPixels, (unsigned long long)s.counter, s.writeRate,
+                          (unsigned long long)s.writes, (unsigned long long)s.verifyFailures);
         else
             std::snprintf(buf, sizeof(buf), "%s   %s", hexKey(s.key).c_str(), s.error.c_str());
         drawText(img, buf, 12, y, s.error.empty() ? cyan : red, 0.48);
         y += rowH;
 
-        const int xBuf = 30, xFlags = 80, xFrame = 150, xValues = 260, xCheck = 540, xNote = 640;
+        const int xBuf = 30, xFlags = 80, xFrame = 150, xValue = 260, xBytes = 400, xCheck = 820, xNote = 920;
         drawText(img, "buf", xBuf, y, gray, 0.45);
         drawText(img, "flags", xFlags, y, gray, 0.45);
         drawText(img, "VTD frame", xFrame, y, gray, 0.45);
-        drawText(img, "written values [p0 p1 p2 p3]", xValues, y, gray, 0.45);
+        drawText(img, "written value", xValue, y, gray, 0.45);
+        drawText(img, "written bytes (hex)", xBytes, y, gray, 0.45);
         drawText(img, "readback", xCheck, y, gray, 0.45);
         drawText(img, "note", xNote, y, gray, 0.45);
         y += rowH;
@@ -469,11 +476,17 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
             drawText(img, buf, xFlags, y, white, 0.45);
             drawText(img, std::to_string(b.frameNo), xFrame, y, white, 0.45);
             if (b.written) {
-                std::snprintf(buf, sizeof(buf), "[%u %u %u %u]", b.values[0], b.values[1], b.values[2], b.values[3]);
-                drawText(img, buf, xValues, y, white, 0.45);
+                drawText(img, std::to_string(b.value), xValue, y, white, 0.45);
+                std::string hex;
+                for (size_t i = 0; i < b.byteCount; ++i) {
+                    char h[4];
+                    std::snprintf(h, sizeof(h), "%02X", b.bytes[i]);
+                    hex += (i ? " " : "") + std::string(h);
+                }
+                drawText(img, hex, xBytes, y, white, 0.45);
                 drawText(img, b.verified ? "OK" : "FAIL", xCheck, y, b.verified ? green : red, 0.45);
             } else {
-                drawText(img, "-", xValues, y, gray, 0.45);
+                drawText(img, "-", xValue, y, gray, 0.45);
             }
             drawText(img, b.note, xNote, y, b.note.empty() ? gray : yellow, 0.45);
             y += rowH;
