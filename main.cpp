@@ -8,10 +8,12 @@
 //    unsigned integer (last byte least significant) that starts at 0 and increases
 //    by one per write cycle.
 //  - Other writers (VTD) are not coordinated with: every buffer is stamped every cycle.
-//  - Overlay build (-DTAG_OVERLAY): additionally a 100x50 ellipse with the counter's last
-//    four digits is drawn in the image centre. Between cycles the stamp and ellipse are
-//    treated as owned territory: they are checked every --poll-us (default 0 = spin)
-//    and rewritten immediately whenever another writer (VTD) has overwritten them.
+//  - Overlay build (-DTAG_OVERLAY): headless (no window). Additionally the counter's last
+//    four digits (white with black outline, within a 100x50 area) are drawn in the image
+//    centre; only the digit pixels are written. Writes at 200 Hz by default (counter +1 per
+//    write). Optionally (--poll-us) the stamp and digits are treated as owned territory
+//    between writes: checked every <us> (0 = spin) and rewritten immediately whenever another
+//    writer (VTD) has overwritten them.
 //  - SHM headers, buffer infos and flags (LOCK / TC / IG) are never written.
 //
 // Usage: ShmFrameTagger [--range <lo> <hi>] [--rate <Hz>] [--poll-us <us>] [key ...]
@@ -22,7 +24,9 @@
 #include <sys/shm.h>
 
 #include <opencv2/core.hpp>
+#ifndef TAG_OVERLAY
 #include <opencv2/highgui.hpp>
+#endif
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
@@ -175,40 +179,63 @@ struct Overlay {
     uint64_t value = UINT64_MAX;
     int firstRow = 0;
     int lastRow = kOverlayH - 1;
+    // Per row, the contiguous runs [first, last] of overlay pixels.
+    std::vector<std::pair<int, int>> spans[kOverlayH];
 };
+
+// One patch shared by all segments (they all write the same counter value); writer thread only.
+Overlay& sharedOverlay()
+{
+    static Overlay overlay;
+    return overlay;
+}
 
 void buildOverlay(Overlay& ov, uint64_t value)
 {
     if (ov.value == value)
         return;
 
+    // Only the digits are drawn: white glyphs on a black outline (readable on any background).
+    // Only pixels of glyph + outline are written to the image.
     cv::Mat bgr(kOverlayH, kOverlayW, CV_8UC3, cv::Scalar(0, 0, 0));
     cv::Mat mask(kOverlayH, kOverlayW, CV_8U, cv::Scalar(0));
-    const cv::Point center(kOverlayW / 2, kOverlayH / 2);
-    const cv::Size axes(kOverlayW / 2 - 1, kOverlayH / 2 - 1);
-    cv::ellipse(mask, center, axes, 0, 0, 360, cv::Scalar(255), cv::FILLED, cv::LINE_8);
-    cv::ellipse(bgr, center, axes, 0, 0, 360, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_8);
-    cv::ellipse(bgr, center, axes, 0, 0, 360, cv::Scalar(0, 0, 255), 2, cv::LINE_8);
 
     char text[8];
     std::snprintf(text, sizeof(text), "%04u", static_cast<unsigned>(value % 10000));
     int baseline = 0;
-    const double scale = 0.8;
+    const double scale = 0.9;
     const int thickness = 2;
+    const int outline = 5;
     const cv::Size ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, thickness, &baseline);
-    cv::putText(bgr, text, cv::Point((kOverlayW - ts.width) / 2, (kOverlayH + ts.height) / 2),
-                cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(0, 0, 0), thickness, cv::LINE_AA);
+    const cv::Point org((kOverlayW - ts.width) / 2, (kOverlayH + ts.height) / 2);
+    cv::putText(mask, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(255), outline, cv::LINE_8);
+    cv::putText(bgr, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(255, 255, 255), thickness, cv::LINE_8);
 
     cv::flip(bgr, bgr, 0);
     cv::flip(mask, ov.mask, 0);
     cv::cvtColor(bgr, ov.rgb, cv::COLOR_BGR2RGB);
     ov.value = value;
-    ov.firstRow = 0;
-    while (ov.firstRow < kOverlayH - 1 && cv::countNonZero(ov.mask.row(ov.firstRow)) == 0)
-        ++ov.firstRow;
-    ov.lastRow = kOverlayH - 1;
-    while (ov.lastRow > 0 && cv::countNonZero(ov.mask.row(ov.lastRow)) == 0)
-        --ov.lastRow;
+    ov.firstRow = -1;
+    for (int y = 0; y < kOverlayH; ++y) {
+        const uint8_t* m = ov.mask.ptr<uint8_t>(y);
+        auto& spans = ov.spans[y];
+        spans.clear();
+        for (int x = 0; x < kOverlayW; ++x) {
+            if (!m[x])
+                continue;
+            if (!spans.empty() && spans.back().second == x - 1)
+                spans.back().second = x;
+            else
+                spans.emplace_back(x, x);
+        }
+        if (!spans.empty()) {
+            if (ov.firstRow < 0)
+                ov.firstRow = y;
+            ov.lastRow = y;
+        }
+    }
+    if (ov.firstRow < 0)
+        ov.firstRow = ov.lastRow = 0;
 }
 
 bool isEightBitPerChannel(int fmt)
@@ -269,20 +296,22 @@ public:
     int id() const { return id_; }
     const SegmentStatus& status() const { return status_; }
 
-    // One write cycle: stamps every unlocked buffer that holds an image.
-    void tick()
+    // One write cycle: stamps every buffer that holds an image with `value`.
+    // Returns true if anything was written.
+    bool tick(uint64_t value)
     {
+        value_ = value;
         status_.error.clear();
         RDB_SHM_HDR_t hdr{};
         if (!readAt(0, hdr) || hdr.headerSize == 0 || hdr.noBuffers == 0) {
             status_.error = "no RDB SHM header";
             status_.buffers.clear();
-            return;
+            return false;
         }
 
         status_.buffers.resize(hdr.noBuffers);
 #ifdef TAG_OVERLAY
-        territories_.assign(hdr.noBuffers, Territory{});
+        territories_.resize(hdr.noBuffers);
 #endif
         bool anyWritten = false;
         for (unsigned i = 0; i < hdr.noBuffers; ++i) {
@@ -294,7 +323,7 @@ public:
         }
 
         if (anyWritten) {
-            ++status_.counter;
+            status_.counter = value + 1;
             ++writesInWindow_;
         }
 
@@ -309,22 +338,26 @@ public:
 #endif
             rateStart_ = now;
         }
+        return anyWritten;
     }
 
 #ifdef TAG_OVERLAY
-    // Between cycles: rewrites the stamp and ellipse of any buffer whose territory another
+    // Between cycles: rewrites the stamp and digits of any buffer whose territory another
     // writer has touched. Producers copy the image front to back, so checking the stamp plus
-    // the first and last ellipse rows catches an overwrite wherever the copy currently is.
+    // the first and last digit rows catches an overwrite wherever the copy currently is.
     void guard()
     {
         for (auto& t : territories_) {
             if (!t.valid)
                 continue;
-            if (std::memcmp(base_ + t.dataOffset, t.tag, t.n) == 0 && overlayIntact(t))
+            const bool tagChanged = std::memcmp(base_ + t.dataOffset, t.tag, t.n) != 0;
+            const bool areaChanged = t.overlay && t.hasBg && (!areaRowSame(t, 0) || !areaRowSame(t, kOverlayH - 1));
+            if (!tagChanged && !areaChanged)
                 continue;
-            std::memcpy(base_ + t.dataOffset, t.tag, t.n);
+            if (tagChanged)
+                std::memcpy(base_ + t.dataOffset, t.tag, t.n);
             if (t.overlay)
-                writeOverlay(t.img, t.dataOffset, t.bpp);
+                refreshOverlay(t, tagChanged);
             ++status_.reclaims;
             ++reclaimsInWindow_;
         }
@@ -415,28 +448,40 @@ private:
         // Big-endian counter over all n bytes; a 64-bit counter fills the low 8 bytes and
         // the higher bytes stay 0 (it cannot overflow at 60 Hz in practice).
         uint8_t tag[16 * kTagPixels] = {};
-        bs.value = status_.counter;
+        bs.value = value_;
         for (size_t b = 0; b < n && b < sizeof(uint64_t); ++b)
             tag[n - 1 - b] = static_cast<uint8_t>(bs.value >> (8 * b));
         std::memcpy(bs.bytes, tag, n);
         bs.byteCount = n;
 
+#ifdef TAG_OVERLAY
+        Territory* terr = size_t(bs.index) < territories_.size() ? &territories_[bs.index] : nullptr;
+        if (terr && (terr->dataOffset != dataOffset || terr->bpp != bpp || terr->n != n ||
+                     terr->img.width != img.width || terr->img.height != img.height ||
+                     terr->img.imgSize != img.imgSize))
+            *terr = Territory{};
+        // Our previous stamp is gone: the producer has started writing a new frame.
+        const bool tagChanged = terr && terr->valid && std::memcmp(base_ + dataOffset, terr->tag, n) != 0;
+#endif
+
         std::memcpy(base_ + dataOffset, tag, n);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 #ifdef TAG_OVERLAY
-        buildOverlay(overlay_, status_.counter);
-        const bool overlayOk = writeOverlay(img, dataOffset, bpp);
-        if (!overlayOk)
-            bs.note = "overlay: needs 8-bit RGB/RGBA/gray, >= 100x50";
-        if (size_t(bs.index) < territories_.size()) {
-            Territory& t = territories_[bs.index];
-            t.valid = true;
-            t.overlay = overlayOk;
-            t.dataOffset = dataOffset;
-            t.bpp = bpp;
-            t.img = img;
-            t.n = n;
-            std::memcpy(t.tag, tag, n);
+        if (terr) {
+            terr->valid = true;
+            terr->dataOffset = dataOffset;
+            terr->bpp = bpp;
+            terr->img = img;
+            terr->n = n;
+            std::memcpy(terr->tag, tag, n);
+            terr->overlay = overlaySupported(img, dataOffset, bpp);
+            if (!terr->overlay) {
+                bs.note = "digits: needs 8-bit RGB/RGBA/gray, >= 100x50";
+            } else {
+                buildOverlay(overlay_, value_);
+                if (!refreshOverlay(*terr, tagChanged))
+                    bs.note = "digits deferred: producer is copying";
+            }
         }
 #endif
 
@@ -452,45 +497,6 @@ private:
     }
 
 #ifdef TAG_OVERLAY
-    // Writes the overlay ellipse (only pixels inside it) centred in the image.
-    bool writeOverlay(const RDB_IMAGE_t& img, size_t dataOffset, unsigned bpp)
-    {
-        if (!isEightBitPerChannel(img.pixelFormat) || img.width < kOverlayW || img.height < kOverlayH)
-            return false;
-        const size_t stride = img.imgSize / img.height;
-        if (stride < size_t(img.width) * bpp)
-            return false;
-
-        const size_t x0 = (img.width - kOverlayW) / 2;
-        const size_t y0 = (img.height - kOverlayH) / 2;
-        if (dataOffset + (y0 + kOverlayH - 1) * stride + (x0 + kOverlayW) * bpp > size_)
-            return false;
-
-        for (int y = 0; y < kOverlayH; ++y) {
-            uint8_t* row = base_ + dataOffset + (y0 + y) * stride + x0 * bpp;
-            const uint8_t* src = overlay_.rgb.ptr<uint8_t>(y);
-            const uint8_t* mask = overlay_.mask.ptr<uint8_t>(y);
-            for (int x = 0; x < kOverlayW; ++x) {
-                if (!mask[x])
-                    continue;
-                uint8_t* d = row + x * bpp;
-                const uint8_t* s = src + 3 * x;
-                if (bpp == 1) {
-                    d[0] = static_cast<uint8_t>((s[0] * 77 + s[1] * 150 + s[2] * 29) >> 8);
-                } else {
-                    d[0] = s[0];
-                    d[1] = s[1];
-                    d[2] = s[2];
-                    if (bpp == 4)
-                        d[3] = 255;
-                }
-            }
-        }
-        status_.overlayValue = static_cast<unsigned>(overlay_.value % 10000);
-        status_.overlayActive = true;
-        return true;
-    }
-
     struct Territory {
         bool valid = false;
         bool overlay = false;
@@ -499,42 +505,91 @@ private:
         RDB_IMAGE_t img{};
         size_t n = 0;
         uint8_t tag[16 * kTagPixels] = {};
+        // The 100x50 centre area: producer pixels saved after its last full write (background)
+        // and what we wrote last (background + digits).
+        bool hasBg = false;
+        std::vector<uint8_t> bg;
+        std::vector<uint8_t> written;
     };
 
-    bool overlayRowIntact(const Territory& t, int y) const
+    bool overlaySupported(const RDB_IMAGE_t& img, size_t dataOffset, unsigned bpp) const
+    {
+        if (!isEightBitPerChannel(img.pixelFormat) || img.width < kOverlayW || img.height < kOverlayH)
+            return false;
+        const size_t stride = img.imgSize / img.height;
+        if (stride < size_t(img.width) * bpp)
+            return false;
+        const size_t x0 = (img.width - kOverlayW) / 2;
+        const size_t y0 = (img.height - kOverlayH) / 2;
+        return dataOffset + (y0 + kOverlayH - 1) * stride + (x0 + kOverlayW) * bpp <= size_;
+    }
+
+    uint8_t* areaRow(const Territory& t, int y) const
     {
         const size_t stride = t.img.imgSize / t.img.height;
         const size_t x0 = (t.img.width - kOverlayW) / 2;
         const size_t y0 = (t.img.height - kOverlayH) / 2;
-        const uint8_t* row = base_ + t.dataOffset + (y0 + y) * stride + x0 * t.bpp;
-        const uint8_t* src = overlay_.rgb.ptr<uint8_t>(y);
-        const uint8_t* mask = overlay_.mask.ptr<uint8_t>(y);
-        for (int x = 0; x < kOverlayW; ++x) {
-            if (!mask[x])
-                continue;
-            const uint8_t* d = row + x * t.bpp;
-            const uint8_t* s = src + 3 * x;
-            if (t.bpp == 1) {
-                if (d[0] != static_cast<uint8_t>((s[0] * 77 + s[1] * 150 + s[2] * 29) >> 8))
-                    return false;
-            } else if (d[0] != s[0] || d[1] != s[1] || d[2] != s[2] || (t.bpp == 4 && d[3] != 255)) {
-                return false;
+        return base_ + t.dataOffset + (y0 + y) * stride + x0 * t.bpp;
+    }
+
+    bool areaRowSame(const Territory& t, int y) const
+    {
+        const size_t rowBytes = size_t(kOverlayW) * t.bpp;
+        return t.written.size() == rowBytes * kOverlayH &&
+               std::memcmp(areaRow(t, y), t.written.data() + y * rowBytes, rowBytes) == 0;
+    }
+
+    // Writes background + current digits over the whole centre area, so digits of the previous
+    // value are erased back to the producer's pixels (no ghosting, no visible box).
+    // Returns false if the producer is part-way through copying the area (retry later).
+    bool refreshOverlay(Territory& t, bool tagChanged)
+    {
+        const size_t rowBytes = size_t(kOverlayW) * t.bpp;
+        if (!t.hasBg || !areaRowSame(t, kOverlayH - 1)) {
+            // The producer's copy has passed the whole area: its pixels are the new background.
+            t.bg.resize(rowBytes * kOverlayH);
+            for (int y = 0; y < kOverlayH; ++y)
+                std::memcpy(t.bg.data() + y * rowBytes, areaRow(t, y), rowBytes);
+            t.hasBg = true;
+        } else if (tagChanged || !areaRowSame(t, 0)) {
+            return false;
+        }
+
+        t.written = t.bg;
+        for (int y = 0; y < kOverlayH; ++y) {
+            uint8_t* row = t.written.data() + y * rowBytes;
+            const uint8_t* src = overlay_.rgb.ptr<uint8_t>(y);
+            for (const auto& span : overlay_.spans[y]) {
+                for (int x = span.first; x <= span.second; ++x) {
+                    uint8_t* d = row + x * t.bpp;
+                    const uint8_t* s = src + 3 * x;
+                    if (t.bpp == 1) {
+                        d[0] = static_cast<uint8_t>((s[0] * 77 + s[1] * 150 + s[2] * 29) >> 8);
+                    } else {
+                        d[0] = s[0];
+                        d[1] = s[1];
+                        d[2] = s[2];
+                        if (t.bpp == 4)
+                            d[3] = 255;
+                    }
+                }
             }
         }
+        for (int y = 0; y < kOverlayH; ++y)
+            std::memcpy(areaRow(t, y), t.written.data() + y * rowBytes, rowBytes);
+
+        status_.overlayValue = static_cast<unsigned>(overlay_.value % 10000);
+        status_.overlayActive = true;
         return true;
     }
 
-    bool overlayIntact(const Territory& t) const
-    {
-        return !t.overlay || (overlayRowIntact(t, overlay_.firstRow) && overlayRowIntact(t, overlay_.lastRow));
-    }
-
-    Overlay overlay_;
+    Overlay& overlay_ = sharedOverlay();
     std::vector<Territory> territories_;
     int reclaimsInWindow_ = 0;
 #endif
 
     SegmentStatus status_;
+    uint64_t value_ = 0;
     int id_ = -1;
     uint8_t* base_ = nullptr;
     size_t size_ = 0;
@@ -553,8 +608,12 @@ struct Config {
     long rangeLo = 0x8100;
     long rangeHi = 0x81ff;
     std::set<key_t> keys;
+#ifdef TAG_OVERLAY
+    double rateHz = 200.0;
+#else
     double rateHz = 60.0;
-    int pollUs = 0;
+#endif
+    int pollUs = -1; // overlay build: < 0 disables the territory guard
 };
 
 void writerThread(const Config& cfg, SharedState& shared, std::atomic<bool>& paused)
@@ -572,7 +631,9 @@ void writerThread(const Config& cfg, SharedState& shared, std::atomic<bool>& pau
     const auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / cfg.rateHz));
     auto next = clock::now();
     auto lastScan = clock::time_point{};
+    auto lastPublish = clock::time_point{};
     auto rateStart = clock::now();
+    uint64_t counter = 0;
     int loops = 0;
     double maxLateMs = 0.0;
 
@@ -599,13 +660,19 @@ void writerThread(const Config& cfg, SharedState& shared, std::atomic<bool>& pau
             }
         }
 
-        if (!paused)
+        if (!paused) {
+            bool anyWritten = false;
             for (auto& kv : segments)
-                kv.second->tick();
+                anyWritten = kv.second->tick(counter) || anyWritten;
+            if (anyWritten)
+                ++counter;
+        }
 
         ++loops;
         const double dt = std::chrono::duration<double>(now - rateStart).count();
-        {
+        // The UI only needs a few updates per second; copying every cycle wastes CPU at 300 Hz.
+        if (now - lastPublish >= std::chrono::milliseconds(50) || dt >= 1.0) {
+            lastPublish = now;
             std::lock_guard<std::mutex> lock(shared.mutex);
             shared.segments.clear();
             for (auto& kv : segments)
@@ -626,6 +693,10 @@ void writerThread(const Config& cfg, SharedState& shared, std::atomic<bool>& pau
         if (clock::now() - next > period * 5)
             next = clock::now();
 #ifdef TAG_OVERLAY
+        if (cfg.pollUs < 0) {
+            std::this_thread::sleep_until(next);
+            continue;
+        }
         while (!gStop && clock::now() < next) {
             if (!paused)
                 for (auto& kv : segments)
@@ -641,6 +712,7 @@ void writerThread(const Config& cfg, SharedState& shared, std::atomic<bool>& pau
     }
 }
 
+#ifndef TAG_OVERLAY
 void drawText(cv::Mat& img, const std::string& s, int x, int y, const cv::Scalar& color, double scale = 0.5)
 {
     cv::putText(img, s, cv::Point(x, y), cv::FONT_HERSHEY_SIMPLEX, scale, color, 1, cv::LINE_AA);
@@ -724,14 +796,24 @@ cv::Mat renderTable(const std::vector<SegmentStatus>& segs, double loopRate, dou
     return img;
 }
 
+#endif
+
 void usage(const char* prog)
 {
     std::fprintf(stderr,
                  "Usage: %s [--range <lo> <hi>] [--rate <Hz>] [--poll-us <us>] [key ...]\n"
+#ifdef TAG_OVERLAY
+                 "  Default: all shared memory keys 0x8100-0x81ff at 200 Hz, counter +1 per write.\n"
+                 "  --poll-us: enable the territory guard between writes, checking every <us>\n"
+                 "             (0 = spin, one CPU core busy). Off by default.\n"
+#else
                  "  Default: all shared memory keys 0x8100-0x81ff at 60 Hz.\n"
-                 "  --poll-us: overlay build only, territory check interval (default 0);\n"
-                 "             0 = spin (one CPU core busy, repairs while the producer is still copying).\n"
+#endif
+#ifdef TAG_OVERLAY
+                 "  Runs without a window; stop with Ctrl+C.\n",
+#else
                  "Keys:  q/ESC quit, p pause/resume writing\n",
+#endif
                  prog);
 }
 
@@ -786,6 +868,32 @@ int main(int argc, char** argv)
     std::atomic<bool> paused{false};
     std::thread writer(writerThread, std::cref(cfg), std::ref(shared), std::ref(paused));
 
+#ifdef TAG_OVERLAY
+    // Headless: one summary line every 10 s; stop with Ctrl+C / SIGTERM.
+    std::fprintf(stderr, "%s: %.0f Hz, keys %s-%s%s, Ctrl+C to stop\n", kAppName, cfg.rateHz,
+                 hexKey(cfg.rangeLo).c_str(), hexKey(cfg.rangeHi).c_str(),
+                 cfg.pollUs >= 0 ? ", territory guard on" : "");
+    auto lastReport = std::chrono::steady_clock::now();
+    while (!gStop) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (std::chrono::steady_clock::now() - lastReport < std::chrono::seconds(10))
+            continue;
+        lastReport = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(shared.mutex);
+        uint64_t next = 0, fails = 0, reclaims = 0;
+        double rate = 0.0;
+        for (const auto& s : shared.segments) {
+            next = std::max(next, s.counter);
+            fails += s.verifyFailures;
+            reclaims += s.reclaims;
+            rate = std::max(rate, s.writeRate);
+        }
+        std::fprintf(stderr, "[stats] %zu segment(s)  value %llu (digits %04llu)  %.1f writes/s  max late %.2f ms  "
+                             "readback fail %llu  reclaims %llu\n",
+                     shared.segments.size(), (unsigned long long)next, (unsigned long long)(next % 10000), rate,
+                     shared.maxLateMs, (unsigned long long)fails, (unsigned long long)reclaims);
+    }
+#else
     const std::string title = kAppName;
     cv::namedWindow(title, cv::WINDOW_AUTOSIZE);
     while (!gStop) {
@@ -798,7 +906,7 @@ int main(int argc, char** argv)
             maxLateMs = shared.maxLateMs;
         }
         cv::imshow(title, renderTable(segs, loopRate, maxLateMs, paused));
-        const int k = cv::waitKey(33);
+        const int k = cv::waitKey(100);
         if (k == 'q' || k == 27)
             break;
         if (k == 'p')
@@ -806,9 +914,12 @@ int main(int argc, char** argv)
         if (cv::getWindowProperty(title, cv::WND_PROP_AUTOSIZE) < 0)
             break;
     }
+#endif
 
     gStop = true;
     writer.join();
+#ifndef TAG_OVERLAY
     cv::destroyAllWindows();
+#endif
     return 0;
 }

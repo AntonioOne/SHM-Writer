@@ -16,33 +16,33 @@ identical frames.
 The window shows, per segment and buffer: flags, VTD frame number, the value and bytes just written,
 the read-back check, write rate and counters.
 
-## Overlay variant
+## Overlay variant (headless)
 
-`ShmFrameTaggerOverlay` is built from the same source (`-DTAG_OVERLAY`) and does everything above,
-plus draws a 100×50 px ellipse (white fill, red border) in the centre of the image with the counter's
-last four digits (`0000`–`9999`), updated every write cycle. Only pixels inside the ellipse are
-written. It is drawn upright for viewers that flip the image (OpenGL bottom-up rows) and requires an
-8-bit-per-channel format (RGB8, RGBA8, 8-bit gray); for other formats only the first 4 pixels are
-written.
+`ShmFrameTaggerOverlay` is built from the same source (`-DTAG_OVERLAY`). Differences:
 
-Between 60 Hz cycles the overlay build treats the stamp and the ellipse as **owned territory**: it
-checks them continuously and rewrites them the moment another writer (VTD) overwrites them. The check
-looks at the stamp and the first/last ellipse rows, so a front-to-back image copy is caught while it is
-still in progress and the ellipse is restored before the copy finishes.
+- **No window.** It prints attach/detach events and one summary line every 10 s; stop with Ctrl+C.
+- **200 Hz** by default, counter **+1 per write** (`--rate` to change).
+- Also draws the counter's last four digits (`0000`–`9999`) in the image centre (100×50 area):
+  white digits with a black outline, no surrounding shape. The producer's pixels in that area are
+  saved after each new VTD frame, and every write composes *saved background + new digits*, so
+  digits of the previous value are erased (no ghosting, no visible box).
+- If VTD is part-way through copying the centre area, the digits are deferred to the next cycle
+  so that a half-written frame is never saved as background. The first-4-pixel counter is
+  written every cycle regardless, so frames never repeat.
+- Only 8-bit-per-channel formats (RGB8, RGBA8, 8-bit gray) get digits; others only get the counter.
+- Optional territory guard between writes: `--poll-us <us>` (0 = spin, one CPU core busy). Off by
+  default.
+- Links only `opencv_core` and `opencv_imgproc` (no GUI libraries).
 
-- `--poll-us 0` (default): spin; uses about one CPU core. With a reader that reads the instant a new
-  VTD frame appears, the ellipse was present in 100 % of frames (simulated VTD) and in 600/600 random
-  samples on a real VTD.
-- `--poll-us 100`: check every 100 µs; about 20 % of one core, ellipse present at the instant of a new
-  frame in about 80 % of frames.
-
-The window shows how often the territory was reclaimed (≈ the rate at which VTD writes new frames).
+Measured with a simulated VTD of 2 × 3840×2160 + 9 × 2560×1440 RGB8 streams (whole-image copy per
+frame): the tagger at 200 Hz used about 6 % of one CPU core (the simulated VTD itself 53 % at 30 Hz,
+~120 % at 60 Hz).
 
 Run only one of the two programs at a time: both write the first 4 pixels.
 
 ## Build
 
-Requires OpenCV 4 (core, imgproc, highgui).
+Requires OpenCV 4 (core, imgproc; highgui only for the windowed `ShmFrameTagger`).
 
 ```bash
 cmake -S . -B build
@@ -55,8 +55,8 @@ cmake --build build
 ./build/ShmFrameTagger                      # all keys 0x8100-0x81ff at 60 Hz
 ./build/ShmFrameTagger 0x08130 0x08131      # only these keys
 ./build/ShmFrameTagger --rate 60 --range 0x8100 0x81ff
-./build/ShmFrameTaggerOverlay               # same options, plus the centre ellipse counter
-./build/ShmFrameTaggerOverlay --poll-us 100 # cheaper territory check
+./build/ShmFrameTaggerOverlay               # headless, 200 Hz, plus centre digits
+./build/ShmFrameTaggerOverlay --rate 300    # other rate
 ```
 
 Keys: `q`/`ESC` quit, `p` pause/resume writing.
