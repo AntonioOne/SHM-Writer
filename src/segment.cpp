@@ -331,3 +331,15 @@ bool Segment::guard(const digits::Stamp& stamp)
     }
     return hot;
 }
+
+void Segment::removeStamps()
+{
+    for (auto& a : areas_) {
+        if (!a.valid || !a.hasBg || a.seen.size() != a.bg.size())
+            continue;
+        mergeProducerWrites(a); // anything VTD wrote meanwhile belongs to the background
+        const size_t bytes = size_t(digits::kWidth) * a.bpp;
+        for (int r = 0; r < digits::kHeight; ++r)
+            std::memcpy(areaRow(a, r), a.bg.data() + r * bytes, bytes);
+    }
+}

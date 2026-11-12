@@ -13,7 +13,8 @@ option(STATIC_RUNTIME "Link libstdc++ and libgcc statically" ON)
 add_executable(ShmFrameTagger
     src/main.cpp
     src/segment.cpp
-    src/digits.cpp)
+    src/digits.cpp
+    src/single_instance.cpp)
 target_compile_options(ShmFrameTagger PRIVATE -Wall -Wextra)
 if(STATIC_RUNTIME)
     target_link_libraries(ShmFrameTagger PRIVATE -static-libstdc++ -static-libgcc)

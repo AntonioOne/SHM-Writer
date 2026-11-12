@@ -40,6 +40,9 @@ public:
     // sleeping so the stamp is restored within microseconds.
     bool guard(const digits::Stamp& stamp);
 
+    // On exit: puts VTD's own pixels back where the stamp is, so no stale digits remain.
+    void removeStamps();
+
 private:
     // Stamp area (top-right corner of the displayed image) of one buffer.
     struct Area {

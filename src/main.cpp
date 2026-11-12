@@ -34,6 +34,7 @@
 
 #include "digits.h"
 #include "segment.h"
+#include "single_instance.h"
 
 namespace {
 
@@ -49,6 +50,7 @@ struct Config {
     int pollUs = 50;
     int statsSec = 10;
     bool realtime = false;
+    bool stop = false;
 };
 
 std::string hexKey(key_t key)
@@ -86,6 +88,7 @@ void usage(const char* prog)
 {
     std::fprintf(stderr,
                  "Usage: %s [--rate <Hz>] [--poll-us <us>] [--realtime] [--range <lo> <hi>] [--stats <s>] [key ...]\n"
+                 "       %s --stop\n"
                  "  Draws a 0000-9999 counter (25x9 px) in the top-right corner of every RDB image in\n"
                  "  shared memory keys 0x8100-0x81ff (or the given keys / range).\n"
                  "  --rate     write cycles per second, counter +1 per cycle (default 200)\n"
@@ -94,8 +97,10 @@ void usage(const char* prog)
                  "  --stats    seconds between status lines, 0 = off (default 10)\n"
                  "  --realtime run with real-time priority (SCHED_FIFO 50) so the stamp is restored\n"
                  "             within microseconds even under load; needs root or cap_sys_nice\n"
-                 "  Stop with Ctrl+C.\n",
-                 prog);
+                 "  --stop     stop the running instance (also when it runs in the background) and exit\n"
+                 "  Only one instance runs at a time: starting it again stops the running one first.\n"
+                 "  Stop with Ctrl+C or --stop; the digits are removed from the images on exit.\n",
+                 prog, prog);
 }
 
 bool parseArgs(int argc, char** argv, Config& cfg)
@@ -118,6 +123,8 @@ bool parseArgs(int argc, char** argv, Config& cfg)
             if (!parseNumber(argv[++i], v) || v < 0)
                 return false;
             cfg.statsSec = int(v);
+        } else if (a == "--stop") {
+            cfg.stop = true;
         } else if (a == "--realtime") {
             cfg.realtime = true;
         } else if (a == "--range" && i + 2 < argc) {
@@ -142,8 +149,16 @@ int main(int argc, char** argv)
         usage(argv[0]);
         return 1;
     }
+    if (cfg.stop)
+        return SingleInstance::stopRunning("ShmFrameTagger");
+
     std::signal(SIGINT, [](int) { gStop = true; });
     std::signal(SIGTERM, [](int) { gStop = true; });
+    std::signal(SIGHUP, [](int) { gStop = true; });
+
+    SingleInstance instance("ShmFrameTagger");
+    if (!instance.acquire())
+        return 1;
     // The default 50 us timer slack would stretch the short polling sleeps considerably.
     prctl(PR_SET_TIMERSLACK, 1000UL);
     if (cfg.realtime) {
@@ -247,6 +262,9 @@ int main(int argc, char** argv)
         }
     }
 
+    for (auto& kv : segments)
+        kv.second->removeStamps();
+    std::fprintf(stderr, "ShmFrameTagger stopped, digits removed\n");
     segments.clear();
     return 0;
 }

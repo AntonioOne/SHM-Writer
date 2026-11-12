@@ -20,6 +20,10 @@ never identical — even when VTD stalls.
 - A transiently unparsable message header (VTD rewrites it when publishing) does not interrupt the
   guarding of a buffer.
 - `--realtime` runs with SCHED_FIFO priority so the restore is not delayed by the scheduler.
+- **Single instance:** a lock file `/tmp/ShmFrameTagger.lock` (flock + PID) ensures only one writer
+  runs. Starting it again stops the running instance first (SIGTERM, SIGKILL after 5 s); an
+  instance owned by another user is reported instead. `--stop` stops the running instance.
+  On exit (Ctrl+C, SIGTERM, SIGHUP, `--stop`) the digits are removed from the images.
 - No GUI, no OpenCV; links libstdc++ statically, so the binary needs only glibc ≥ 2.17.
 
 ## Layout
@@ -28,6 +32,7 @@ never identical — even when VTD stalls.
 src/rdb_shm.h     RDB structures (subset of VTD's viRDBIcd.h)
 src/digits.*      5x7 font and the 25x9 counter stamp
 src/segment.*     one shared memory segment: image lookup, background merge, stamp drawing
+src/single_instance.*  lock file: one running instance, --stop
 src/main.cpp      options, segment discovery, timing loop, status output
 package.sh        builds the customer package (dist/)
 packaging/        customer README (Chinese)
@@ -51,7 +56,7 @@ sudo setcap cap_sys_nice+ep build/ShmFrameTagger && ./build/ShmFrameTagger --rat
 ```
 
 Options: `--rate <Hz>`, `--poll-us <us>` (0 = spin, -1 = off), `--realtime`, `--range <lo> <hi>`,
-`--stats <s>` (status line interval, 0 = off). Stop with Ctrl+C.
+`--stats <s>` (status line interval, 0 = off). Stop with Ctrl+C or `./build/ShmFrameTagger --stop`.
 
 ## Notes
 
@@ -89,5 +94,5 @@ VTD stalled at 16 Hz, 30 Hz reader: 0 identical consecutive images and 0 reads w
 ## Packaging
 
 ```bash
-./package.sh 2.1     # -> dist/ShmFrameTagger-2.1-linux-x86_64.tar.gz (+ .sha256)
+./package.sh 2.2     # -> dist/ShmFrameTagger-2.2-linux-x86_64.tar.gz (+ .sha256)
 ```

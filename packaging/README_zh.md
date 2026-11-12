@@ -1,4 +1,4 @@
-# ShmFrameTagger 2.1
+# ShmFrameTagger 2.2
 
 ShmFrameTagger 用于 VTD 共享内存图像的**防重复帧**。
 
@@ -11,7 +11,7 @@ ShmFrameTagger 用于 VTD 共享内存图像的**防重复帧**。
 ## 1. 包内容
 
 ```
-ShmFrameTagger-2.1-linux-x86_64/
+ShmFrameTagger-2.2-linux-x86_64/
 ├── ShmFrameTagger      可执行程序（单文件，无需任何依赖库）
 └── README.md           本说明
 ```
@@ -29,8 +29,8 @@ ShmFrameTagger-2.1-linux-x86_64/
 ## 3. 快速开始
 
 ```bash
-tar xzf ShmFrameTagger-2.1-linux-x86_64.tar.gz
-cd ShmFrameTagger-2.1-linux-x86_64
+tar xzf ShmFrameTagger-2.2-linux-x86_64.tar.gz
+cd ShmFrameTagger-2.2-linux-x86_64
 ./ShmFrameTagger --rate 400
 ```
 
@@ -45,12 +45,30 @@ sudo setcap cap_sys_nice+ep ./ShmFrameTagger      # 只需执行一次（重新�
 
 先启动 VTD 或先启动本程序都可以。程序会自动发现并接管 key 为 `0x8100`–`0x81FF` 的所有图像共享内存；VTD 重启、共享内存被删除或重建时也会自动重新连接。
 
-按 `Ctrl+C` 停止。
+## 3.1 启动与关闭
+
+| 操作 | 方法 |
+|---|---|
+| 关闭（在前台运行时） | 按 `Ctrl+C` |
+| 关闭（在后台运行、或在另一个终端） | `./ShmFrameTagger --stop` |
+| 关闭用 `sudo`/root 启动的实例 | `sudo ./ShmFrameTagger --stop` |
+| 查看是否在运行 | `./ShmFrameTagger --stop` 会提示 `is not running`；或 `pgrep -a ShmFrameTagger` |
+
+- `--stop` 会通知正在运行的实例正常退出，并等它真正退出后才返回；5 秒内未退出则强制结束。
+- 程序正常退出时会**擦除自己写入的数字**，把右上角恢复成 VTD 原画面。
+- 关闭终端窗口也会使程序正常退出。
+
+**同一时间只会运行一个实例。** 如果已经有一个在运行（不论在前台还是后台），再次启动时程序会先打印
+`another instance is running (PID ...), stopping it first...`，停止旧实例后再启动新的。
+如果旧实例属于其他用户或 root，普通用户无权停止它，程序会提示 `stop it with: sudo kill <PID>` 并退出，不会与之同时运行。
+
+> 使用 systemd 服务（见第 10 节）运行时，请只用 `systemctl stop/start/restart` 控制。若在服务运行时手动启动程序，手动启动的实例会停掉服务实例，而 systemd 又会重新拉起服务，两者会互相停止。
 
 ## 4. 命令行参数
 
 ```
 ./ShmFrameTagger [--rate <Hz>] [--poll-us <微秒>] [--realtime] [--range <起始key> <结束key>] [--stats <秒>] [key ...]
+./ShmFrameTagger --stop
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -61,6 +79,7 @@ sudo setcap cap_sys_nice+ep ./ShmFrameTagger      # 只需执行一次（重新�
 | `--range <起始> <结束>` | `0x8100 0x81ff` | 自动接管的共享内存 key 范围。 |
 | `--stats <秒>` | `10` | 状态输出间隔，`0` = 不输出。 |
 | `key ...` | 无 | 只处理指定的 key，例如 `./ShmFrameTagger 0x08130 0x08131`。 |
+| `--stop` | — | 停止正在运行的实例（包括后台运行的）后退出，见第 3.1 节。 |
 
 示例：
 
@@ -78,6 +97,7 @@ ShmFrameTagger: 400 Hz, keys 0x08100-0x081ff, overwrite check every 50 us, real-
 [0x08131] attached (3110836 bytes)
 [stats] 2 segment(s)  digits 3974  400.0 cycles/s  max late 0.30 ms  writes 7948  restored after VTD overwrite 1200
 [0x08131] detached                          ← 该共享内存已被删除（例如 VTD 退出）
+ShmFrameTagger stopped, digits removed      ← 程序退出，已擦除数字
 ```
 
 | 字段 | 含义 |
@@ -145,13 +165,14 @@ VTD 的 IG 需要把图像写入 key 在 `0x8100`–`0x81FF` 范围内的共享�
 - 读取方的读取频率应不高于 `--rate`，否则两次读取之间可能尚未写入新数字。
 - 如果下游算法对图像内容敏感，处理时请忽略右上角 25×9 像素。
 - 程序重启后数字从 `0000` 重新开始。
+- 程序退出时会擦除数字；之后 VTD 若不再输出新图像，读取方读到的图像就会重复（这是预期行为）。
 
 ### 后台运行
 
 ```bash
 nohup ./ShmFrameTagger --rate 400 --realtime > tagger.log 2>&1 &
 # 停止：
-kill $(pgrep -x ShmFrameTagger)
+./ShmFrameTagger --stop
 ```
 
 ### 开机自动运行（systemd 示例）
@@ -165,7 +186,7 @@ After=network.target
 
 [Service]
 User=vtd
-ExecStart=/opt/ShmFrameTagger-2.1-linux-x86_64/ShmFrameTagger --rate 400
+ExecStart=/opt/ShmFrameTagger-2.2-linux-x86_64/ShmFrameTagger --rate 400
 Restart=always
 # 实时优先级（使用 systemd 时不需要 setcap）
 CPUSchedulingPolicy=fifo
@@ -182,6 +203,9 @@ journalctl -u shm-frame-tagger -f      # 查看输出
 ```
 
 ## 11. 常见问题
+
+**启动时提示 `another instance is running (PID ...), stopping it first...`**
+已有一个实例在运行，程序会自动停止它再启动，属正常现象。若随后提示 `belongs to another user`，说明旧实例是用其他用户或 root 启动的，请用 `sudo ./ShmFrameTagger --stop` 停止后再启动。
 
 **启动后一直没有 `attached` 输出**
 当前没有 key 在 `0x8100`–`0x81FF` 范围内的共享内存。请确认 VTD 已运行并按第 9 节配置；可用 `ipcs -m` 查看现有共享内存。
