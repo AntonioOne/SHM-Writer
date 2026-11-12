@@ -1,4 +1,4 @@
-// Minimal subset of VTD's viRDBIcd.h needed to read RDB image shared memory.
+// Minimal subset of VTD's viRDBIcd.h needed to locate RDB images in shared memory.
 // Layouts must match the original (#pragma pack 4).
 #pragma once
 
@@ -8,28 +8,12 @@
 
 #define RDB_PKG_ID_IMAGE 22
 
-#define RDB_SHM_BUFFER_FLAG_LOCK 0x00000001
-#define RDB_SHM_BUFFER_FLAG_TC   0x00000002
-#define RDB_SHM_BUFFER_FLAG_IG   0x00000004
-
 #define RDB_PIX_FORMAT_RGB_24      2
 #define RDB_PIX_FORMAT_RGBA_24     5
 #define RDB_PIX_FORMAT_BW_8        6
-#define RDB_PIX_FORMAT_BW_16       7
-#define RDB_PIX_FORMAT_RGB_32_F   12
-#define RDB_PIX_FORMAT_RGBA_32_F  13
-#define RDB_PIX_FORMAT_RGB_16_F   16
-#define RDB_PIX_FORMAT_RGBA_16_F  17
 #define RDB_PIX_FORMAT_RED8       28
-#define RDB_PIX_FORMAT_RED16      29
 #define RDB_PIX_FORMAT_RGB8       39
 #define RDB_PIX_FORMAT_RGBA8      40
-#define RDB_PIX_FORMAT_RGB16      42
-#define RDB_PIX_FORMAT_RGB16F     43
-#define RDB_PIX_FORMAT_RGBA16     44
-#define RDB_PIX_FORMAT_RGBA16F    45
-#define RDB_PIX_FORMAT_RGB32F     47
-#define RDB_PIX_FORMAT_RGBA32F    49
 
 #pragma pack(push, 4)
 

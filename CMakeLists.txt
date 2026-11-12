@@ -7,15 +7,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui)
-find_package(Threads REQUIRED)
+# Link libstdc++/libgcc statically so the binary only needs glibc on the target machine.
+option(STATIC_RUNTIME "Link libstdc++ and libgcc statically" ON)
 
-add_executable(ShmFrameTagger main.cpp)
-target_include_directories(ShmFrameTagger PRIVATE ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(ShmFrameTagger PRIVATE ${OpenCV_LIBS} Threads::Threads)
-
-# Headless variant: 200 Hz, plus 0000-9999 counter digits drawn in the image centre.
-add_executable(ShmFrameTaggerOverlay main.cpp)
-target_compile_definitions(ShmFrameTaggerOverlay PRIVATE TAG_OVERLAY)
-target_include_directories(ShmFrameTaggerOverlay PRIVATE ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(ShmFrameTaggerOverlay PRIVATE opencv_core opencv_imgproc Threads::Threads)
+add_executable(ShmFrameTagger
+    src/main.cpp
+    src/segment.cpp
+    src/digits.cpp)
+target_compile_options(ShmFrameTagger PRIVATE -Wall -Wextra)
+if(STATIC_RUNTIME)
+    target_link_libraries(ShmFrameTagger PRIVATE -static-libstdc++ -static-libgcc)
+endif()
