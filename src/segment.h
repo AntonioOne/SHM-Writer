@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -34,7 +35,10 @@ public:
     void tick(const digits::Stamp& stamp);
 
     // Between cycles: redraws `stamp` in buffers whose stamp area the producer has overwritten.
-    void guard(const digits::Stamp& stamp);
+    // Returns true while a buffer is "hot": a new frame number was published and the producer
+    // is expected to copy the frame over the stamp shortly -> the caller should poll without
+    // sleeping so the stamp is restored within microseconds.
+    bool guard(const digits::Stamp& stamp);
 
 private:
     // Stamp area (top-right corner of the displayed image) of one buffer.
@@ -49,13 +53,21 @@ private:
         std::vector<uint8_t> bg;   // producer pixels under the stamp
         std::vector<uint8_t> seen; // area content as last written or observed
         bool pending = false;      // producer changed the area; redraw once it is stable
+        std::chrono::steady_clock::time_point lastChange; // last producer write seen in the area
+        size_t msgOffset = 0;      // RDB message header of this buffer (frame number)
+        uint32_t lastFrame = 0;
+        bool hot = false;          // new frame published, stamp not yet restored
+        std::chrono::steady_clock::time_point hotUntil;
+        std::chrono::steady_clock::time_point failingSince; // image lookup failing since (epoch = ok)
     };
 
     template <typename T>
     bool readAt(size_t offset, T& out) const;
     bool locateImage(const RDB_SHM_BUFFER_INFO_t& info, RDB_IMAGE_t& img, size_t& dataOffset) const;
     void updateArea(size_t index, size_t infoOffset);
+    void lookupFailed(Area& a, const std::string& problem);
     uint8_t* areaRow(const Area& a, int row) const;
+    uint32_t frameNo(const Area& a) const;
     void captureBackground(Area& a);
     bool mergeProducerWrites(Area& a);
     void draw(Area& a, const digits::Stamp& stamp);

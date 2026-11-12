@@ -3,7 +3,7 @@
 # The binary links libstdc++/libgcc statically and needs only glibc on the target.
 set -euo pipefail
 cd "$(dirname "$0")"
-VERSION=${1:-2.0}
+VERSION=${1:-2.1}
 NAME=ShmFrameTagger-$VERSION-linux-x86_64
 OUT=dist/$NAME
 

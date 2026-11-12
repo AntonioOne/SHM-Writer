@@ -1,4 +1,4 @@
-# ShmFrameTagger 2.0
+# ShmFrameTagger 2.1
 
 ShmFrameTagger 用于 VTD 共享内存图像的**防重复帧**。
 
@@ -11,7 +11,7 @@ ShmFrameTagger 用于 VTD 共享内存图像的**防重复帧**。
 ## 1. 包内容
 
 ```
-ShmFrameTagger-2.0-linux-x86_64/
+ShmFrameTagger-2.1-linux-x86_64/
 ├── ShmFrameTagger      可执行程序（单文件，无需任何依赖库）
 └── README.md           本说明
 ```
@@ -29,10 +29,19 @@ ShmFrameTagger-2.0-linux-x86_64/
 ## 3. 快速开始
 
 ```bash
-tar xzf ShmFrameTagger-2.0-linux-x86_64.tar.gz
-cd ShmFrameTagger-2.0-linux-x86_64
-./ShmFrameTagger
+tar xzf ShmFrameTagger-2.1-linux-x86_64.tar.gz
+cd ShmFrameTagger-2.1-linux-x86_64
+./ShmFrameTagger --rate 400
 ```
+
+**推荐**（让数字在任何时刻都几乎一直存在）：授予一次实时优先级权限，然后加 `--realtime` 运行：
+
+```bash
+sudo setcap cap_sys_nice+ep ./ShmFrameTagger      # 只需执行一次（重新解压或替换程序后需再执行）
+./ShmFrameTagger --rate 400 --realtime
+```
+
+不授予权限也可以运行，程序会提示并以普通优先级继续工作，只是系统繁忙时数字偶尔会缺失约 1 毫秒。
 
 先启动 VTD 或先启动本程序都可以。程序会自动发现并接管 key 为 `0x8100`–`0x81FF` 的所有图像共享内存；VTD 重启、共享内存被删除或重建时也会自动重新连接。
 
@@ -41,13 +50,14 @@ cd ShmFrameTagger-2.0-linux-x86_64
 ## 4. 命令行参数
 
 ```
-./ShmFrameTagger [--rate <Hz>] [--poll-us <微秒>] [--range <起始key> <结束key>] [--stats <秒>] [key ...]
+./ShmFrameTagger [--rate <Hz>] [--poll-us <微秒>] [--realtime] [--range <起始key> <结束key>] [--stats <秒>] [key ...]
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--rate <Hz>` | `200` | 写入频率，每写入一次数字加 1。读取方的读取频率应**不高于**此频率。 |
 | `--poll-us <微秒>` | `50` | 两次写入之间检查 VTD 是否覆盖了数字的间隔。VTD 写入新帧覆盖数字后，程序会立即补画。值越小补画越及时，CPU 占用越高。`0` = 持续检查（占满一个 CPU 核），`-1` = 关闭检查。 |
+| `--realtime` | 关闭 | 以实时优先级（SCHED_FIFO 50）运行，保证 VTD 覆盖数字后在几微秒内补画，不受系统负载影响。需要 root 权限或预先执行 `sudo setcap cap_sys_nice+ep ./ShmFrameTagger`；权限不足时给出提示并以普通优先级继续运行。 |
 | `--range <起始> <结束>` | `0x8100 0x81ff` | 自动接管的共享内存 key 范围。 |
 | `--stats <秒>` | `10` | 状态输出间隔，`0` = 不输出。 |
 | `key ...` | 无 | 只处理指定的 key，例如 `./ShmFrameTagger 0x08130 0x08131`。 |
@@ -55,7 +65,7 @@ cd ShmFrameTagger-2.0-linux-x86_64
 示例：
 
 ```bash
-./ShmFrameTagger --rate 400                 # 400 Hz 写入（读取频率 60 Hz 以上时推荐）
+./ShmFrameTagger --rate 400 --realtime      # 推荐配置
 ./ShmFrameTagger 0x08130 0x08131            # 只处理两路
 ./ShmFrameTagger --poll-us 100              # 降低 CPU 占用
 ```
@@ -63,7 +73,7 @@ cd ShmFrameTagger-2.0-linux-x86_64
 ## 5. 运行输出
 
 ```
-ShmFrameTagger: 400 Hz, keys 0x08100-0x081ff, overwrite check every 50 us, Ctrl+C to stop
+ShmFrameTagger: 400 Hz, keys 0x08100-0x081ff, overwrite check every 50 us, real-time priority, Ctrl+C to stop
 [0x08130] attached (3110836 bytes)          ← 发现并接管一路共享内存
 [0x08131] attached (3110836 bytes)
 [stats] 2 segment(s)  digits 3974  400.0 cycles/s  max late 0.30 ms  writes 7948  restored after VTD overwrite 1200
@@ -95,20 +105,25 @@ ShmFrameTagger: 400 Hz, keys 0x08100-0x081ff, overwrite check every 50 us, Ctrl+
 
 1. 每 0.5 秒扫描一次系统共享内存，接管范围内含有 RDB 图像的共享内存。
 2. 按 `--rate` 的频率，在每个缓冲（双缓冲的两个缓冲都处理）的右上角写入新的数字。
-3. 两次写入之间，每隔 `--poll-us` 检查一次数字区域：VTD 写入新帧覆盖数字时，把它写入的像素记为新背景，等区域稳定后立即补画数字。
+3. 两次写入之间，每隔 `--poll-us` 检查一次数字区域：VTD 写入新帧覆盖数字时，把它写入的像素记为新背景，区域稳定（3 微秒内无新写入）后立即补画数字。
+   VTD 发布新帧号约 0.2 毫秒后才拷贝像素，因此程序在检测到新帧号后会对该缓冲连续检查（不休眠，最长 5 毫秒），直到数字补画完成，数字缺失的时间只有几微秒。
 4. VTD 卡顿、不写新帧时，数字仍按写入频率持续变化，因此读取方连续两次读到的图像不会相同。
 
 ## 8. 性能参考
 
-测试环境：模拟 VTD 共 11 路（2 × 3840×2160 + 9 × 2560×1440，RGB8，每路 60 Hz 整帧写入），`--rate 400`，默认 `--poll-us 50`。
+**真实 VTD**（2 路 960×540 RGB8），`--rate 400 --realtime`，以每秒约一千万次的频率连续读取最新一帧的数字区域：
 
 | 指标 | 结果 |
 |---|---|
-| 本程序 CPU 占用 | 单核约 10 % – 13 % |
-| 读取方任意时刻读取最新一帧时能看到数字的比例 | 98.3 % – 100 %（取决于 VTD 的内存拷贝方式） |
-| VTD 降到 16 Hz、读取方 30 Hz 读取 | 连续读到相同图像 0 次，读到无数字图像 0 次（不运行本程序时 150 次中有 109 次相同） |
+| 读到无数字的比例 | 0.003 % |
+| VTD 每次覆盖数字后补画所需时间 | 中位数 5 微秒，最长 13 微秒 |
+| 本程序 CPU 占用 | 单核约 6 % |
+| 不加 `--realtime` 时 | 读到无数字的比例 0.03 %（系统繁忙时偶尔缺失约 1 毫秒） |
 
-说明：VTD 写入新帧时会短暂覆盖数字，程序通常在 0.1 毫秒内补画；如果 VTD 从前往后拷贝图像，右上角是它最后写的位置，因此新帧发布后的约 0.1 毫秒内可能没有数字。
+**模拟 VTD**（11 路：2 × 3840×2160 + 9 × 2560×1440，RGB8，每路 60 Hz），`--rate 400`：本程序 CPU 占用单核约 10 % – 13 %。
+VTD 降到 16 Hz、读取方以 30 Hz 读取时：连续读到相同图像 0 次，读到无数字图像 0 次（不运行本程序时 150 次中有 109 次相同）。
+
+说明：VTD 写入新帧时会覆盖数字，程序在几微秒内补画；这段极短的时间内读取到的图像可能没有数字。
 
 ## 9. VTD 侧要求
 
@@ -134,7 +149,7 @@ VTD 的 IG 需要把图像写入 key 在 `0x8100`–`0x81FF` 范围内的共享�
 ### 后台运行
 
 ```bash
-nohup ./ShmFrameTagger --rate 400 > tagger.log 2>&1 &
+nohup ./ShmFrameTagger --rate 400 --realtime > tagger.log 2>&1 &
 # 停止：
 kill $(pgrep -x ShmFrameTagger)
 ```
@@ -150,8 +165,11 @@ After=network.target
 
 [Service]
 User=vtd
-ExecStart=/opt/ShmFrameTagger-2.0-linux-x86_64/ShmFrameTagger --rate 400
+ExecStart=/opt/ShmFrameTagger-2.1-linux-x86_64/ShmFrameTagger --rate 400
 Restart=always
+# 实时优先级（使用 systemd 时不需要 setcap）
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
 
 [Install]
 WantedBy=multi-user.target
@@ -173,6 +191,9 @@ journalctl -u shm-frame-tagger -f      # 查看输出
 
 **状态输出中出现 `pixel format ... not supported`**
 该路图像不是每通道 8 位的格式（例如浮点或 16 位格式），程序不会写入。
+
+**启动时提示 `warning: --realtime failed (Operation not permitted)`**
+没有实时优先级权限。执行一次 `sudo setcap cap_sys_nice+ep ./ShmFrameTagger` 后再运行，或用 root 运行。不处理也能正常工作。
 
 **画面上看不到数字**
 确认查看器显示的是同一路共享内存，并注意数字很小（25×9 像素），位于画面右上角边缘。

@@ -9,6 +9,15 @@
 
 namespace {
 
+using clock_type = std::chrono::steady_clock;
+
+// The producer copies a frame over the stamp area in microseconds; once no new byte has
+// arrived for this long, the area is considered stable and the stamp is redrawn.
+constexpr auto kSettle = std::chrono::microseconds(3);
+// After a new frame number, poll continuously for at most this long (VTD publishes the frame
+// number ~0.2 ms before it copies the pixels).
+constexpr auto kHotWindow = std::chrono::milliseconds(5);
+
 const char* formatName(int fmt)
 {
     switch (fmt) {
@@ -117,7 +126,21 @@ bool Segment::locateImage(const RDB_SHM_BUFFER_INFO_t& info, RDB_IMAGE_t& img, s
     return false;
 }
 
-// Re-reads the buffer layout and updates the stamp area; invalid if no usable image.
+// VTD rewrites the message header when it publishes a frame, so the image lookup can fail for
+// a moment. Keep guarding the last known area meanwhile; give up only if it keeps failing.
+void Segment::lookupFailed(Area& a, const std::string& problem)
+{
+    const auto now = clock_type::now();
+    if (a.failingSince == clock_type::time_point{})
+        a.failingSince = now;
+    if (a.valid && now - a.failingSince < std::chrono::seconds(1))
+        return;
+    a.valid = false;
+    if (stats_.problem.empty())
+        stats_.problem = problem;
+}
+
+// Re-reads the buffer layout and updates the stamp area.
 void Segment::updateArea(size_t index, size_t infoOffset)
 {
     Area& a = areas_[index];
@@ -125,9 +148,7 @@ void Segment::updateArea(size_t index, size_t infoOffset)
     RDB_IMAGE_t img{};
     size_t dataOffset = 0;
     if (!readAt(infoOffset, info) || !locateImage(info, img, dataOffset)) {
-        a.valid = false;
-        if (stats_.problem.empty())
-            stats_.problem = "no RDB image";
+        lookupFailed(a, "no RDB image");
         return;
     }
 
@@ -138,21 +159,21 @@ void Segment::updateArea(size_t index, size_t infoOffset)
                   formatName(img.pixelFormat) ? formatName(img.pixelFormat) : "unsupported format");
     stats_.image = desc;
     if (bpp == 0) {
-        a.valid = false;
-        stats_.problem = "pixel format " + std::to_string(img.pixelFormat) + " not supported (8-bit RGB/RGBA/gray only)";
+        lookupFailed(a, "pixel format " + std::to_string(img.pixelFormat) + " not supported (8-bit RGB/RGBA/gray only)");
         return;
     }
     if (img.width < digits::kWidth || img.height < digits::kHeight || stride < size_t(img.width) * bpp ||
         dataOffset + size_t(img.height) * stride > size_) {
-        a.valid = false;
-        stats_.problem = "image too small or inconsistent";
+        lookupFailed(a, "image too small or inconsistent");
         return;
     }
+    a.failingSince = clock_type::time_point{};
 
     if (!a.valid || a.dataOffset != dataOffset || a.width != img.width || a.height != img.height ||
         a.bpp != bpp || a.stride != stride)
         a = Area{};
     a.valid = true;
+    a.msgOffset = info.offset;
     a.dataOffset = dataOffset;
     a.width = img.width;
     a.height = img.height;
@@ -167,6 +188,13 @@ uint8_t* Segment::areaRow(const Area& a, int row) const
     const size_t y = a.height - digits::kHeight + row;
     const size_t x = a.width - digits::kWidth;
     return base_ + a.dataOffset + y * a.stride + x * a.bpp;
+}
+
+uint32_t Segment::frameNo(const Area& a) const
+{
+    RDB_MSG_HDR_t msg{};
+    readAt(a.msgOffset, msg);
+    return msg.frameNo;
 }
 
 void Segment::captureBackground(Area& a)
@@ -237,7 +265,8 @@ void Segment::draw(Area& a, const digits::Stamp& stamp)
 
 // Keeps the stamp in one buffer.
 //  - The producer is changing the area (differs from what we last saw): merge its bytes into
-//    the background and wait; writing now could overwrite bytes it writes in the meantime.
+//    the background and wait until nothing new arrived for kSettle; writing earlier could
+//    overwrite bytes it writes in the meantime.
 //  - The area is stable: redraw if the producer had changed it, or if the value changed.
 void Segment::refresh(Area& a, const digits::Stamp& stamp, bool valueChanged)
 {
@@ -246,14 +275,20 @@ void Segment::refresh(Area& a, const digits::Stamp& stamp, bool valueChanged)
         draw(a, stamp);
         return;
     }
+    const auto now = clock_type::now();
     if (mergeProducerWrites(a)) {
         a.pending = true;
+        a.lastChange = now;
         return;
     }
+    if (a.pending && now - a.lastChange < kSettle)
+        return;
     if (!a.pending && !valueChanged)
         return;
-    if (a.pending)
+    if (a.pending) {
         ++stats_.restores;
+        a.hot = false; // the new frame has been copied over the stamp and is stamped again
+    }
     a.pending = false;
     draw(a, stamp);
 }
@@ -277,9 +312,22 @@ void Segment::tick(const digits::Stamp& stamp)
     }
 }
 
-void Segment::guard(const digits::Stamp& stamp)
+bool Segment::guard(const digits::Stamp& stamp)
 {
-    for (auto& a : areas_)
-        if (a.valid)
-            refresh(a, stamp, false);
+    bool hot = false;
+    for (auto& a : areas_) {
+        if (!a.valid)
+            continue;
+        const uint32_t frame = frameNo(a);
+        if (frame != a.lastFrame) {
+            a.lastFrame = frame;
+            a.hot = true;
+            a.hotUntil = clock_type::now() + kHotWindow;
+        }
+        refresh(a, stamp, false);
+        if (a.hot && clock_type::now() >= a.hotUntil)
+            a.hot = false;
+        hot = hot || a.hot || a.pending;
+    }
+    return hot;
 }

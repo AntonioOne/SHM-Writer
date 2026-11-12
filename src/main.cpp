@@ -7,17 +7,23 @@
 // identical, even when VTD stalls.
 //
 // Between cycles the stamp area is checked every --poll-us (default 50 us); whatever VTD has
-// written over it is merged into the saved background and the digits are redrawn at once.
+// written over it is merged into the saved background and the digits are redrawn as soon as the
+// area is stable. Right after VTD publishes a new frame number (it copies the pixels ~0.2 ms
+// later) the buffer is polled continuously until the stamp is restored, so it is missing only
+// for microseconds.
 // Only the 25x9 stamp area is written; SHM headers, buffer infos and flags are never touched.
 
+#include <sched.h>
 #include <sys/prctl.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -42,6 +48,7 @@ struct Config {
     double rateHz = 200.0;
     int pollUs = 50;
     int statsSec = 10;
+    bool realtime = false;
 };
 
 std::string hexKey(key_t key)
@@ -78,13 +85,15 @@ bool parseNumber(const char* s, long& out)
 void usage(const char* prog)
 {
     std::fprintf(stderr,
-                 "Usage: %s [--rate <Hz>] [--poll-us <us>] [--range <lo> <hi>] [--stats <s>] [key ...]\n"
+                 "Usage: %s [--rate <Hz>] [--poll-us <us>] [--realtime] [--range <lo> <hi>] [--stats <s>] [key ...]\n"
                  "  Draws a 0000-9999 counter (25x9 px) in the top-right corner of every RDB image in\n"
                  "  shared memory keys 0x8100-0x81ff (or the given keys / range).\n"
                  "  --rate     write cycles per second, counter +1 per cycle (default 200)\n"
                  "  --poll-us  check interval for VTD overwrites between cycles (default 50;\n"
                  "             0 = spin, one CPU core busy; -1 = off)\n"
                  "  --stats    seconds between status lines, 0 = off (default 10)\n"
+                 "  --realtime run with real-time priority (SCHED_FIFO 50) so the stamp is restored\n"
+                 "             within microseconds even under load; needs root or cap_sys_nice\n"
                  "  Stop with Ctrl+C.\n",
                  prog);
 }
@@ -109,6 +118,8 @@ bool parseArgs(int argc, char** argv, Config& cfg)
             if (!parseNumber(argv[++i], v) || v < 0)
                 return false;
             cfg.statsSec = int(v);
+        } else if (a == "--realtime") {
+            cfg.realtime = true;
         } else if (a == "--range" && i + 2 < argc) {
             if (!parseNumber(argv[i + 1], cfg.rangeLo) || !parseNumber(argv[i + 2], cfg.rangeHi))
                 return false;
@@ -135,14 +146,23 @@ int main(int argc, char** argv)
     std::signal(SIGTERM, [](int) { gStop = true; });
     // The default 50 us timer slack would stretch the short polling sleeps considerably.
     prctl(PR_SET_TIMERSLACK, 1000UL);
+    if (cfg.realtime) {
+        sched_param sp{};
+        sp.sched_priority = 50;
+        if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+            std::fprintf(stderr, "warning: --realtime failed (%s); run as root or after "
+                                 "'sudo setcap cap_sys_nice+ep ShmFrameTagger'. Continuing with normal priority.\n",
+                         std::strerror(errno));
+    }
 
     std::string keys;
     if (cfg.keys.empty())
         keys = hexKey(cfg.rangeLo) + "-" + hexKey(cfg.rangeHi);
     for (key_t k : cfg.keys)
         keys += (keys.empty() ? "" : " ") + hexKey(k);
-    std::fprintf(stderr, "ShmFrameTagger: %.0f Hz, keys %s, overwrite check %s, Ctrl+C to stop\n", cfg.rateHz,
-                 keys.c_str(), cfg.pollUs < 0 ? "off" : ("every " + std::to_string(cfg.pollUs) + " us").c_str());
+    std::fprintf(stderr, "ShmFrameTagger: %.0f Hz, keys %s, overwrite check %s%s, Ctrl+C to stop\n", cfg.rateHz,
+                 keys.c_str(), cfg.pollUs < 0 ? "off" : ("every " + std::to_string(cfg.pollUs) + " us").c_str(),
+                 sched_getscheduler(0) == SCHED_FIFO ? ", real-time priority" : "");
 
     auto wanted = [&](key_t key) {
         return cfg.keys.empty() ? (key >= cfg.rangeLo && key <= cfg.rangeHi) : cfg.keys.count(key) > 0;
@@ -216,9 +236,11 @@ int main(int argc, char** argv)
             continue;
         }
         while (!gStop && clock_type::now() < next) {
+            bool hot = false;
             for (auto& kv : segments)
-                kv.second->guard(stamp);
-            if (cfg.pollUs > 0)
+                hot = kv.second->guard(stamp) || hot;
+            // Right after VTD publishes a frame, poll without sleeping until the stamp is back.
+            if (cfg.pollUs > 0 && !hot)
                 std::this_thread::sleep_for(std::chrono::microseconds(cfg.pollUs));
             else
                 __builtin_ia32_pause();
